@@ -10,11 +10,7 @@ warnings.filterwarnings("ignore")
 from engine.solver import Trainer
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import mean_absolute_error
-from torch.utils.data import Dataset, DataLoader
-from gluonts.dataset.repository.datasets import get_dataset
-from gluonts.dataset.multivariate_grouper import MultivariateGrouper
 from Utils.io_utils import load_yaml_config, instantiate_from_config
-from Models.autoregressive_diffusion.model_utils import normalize_to_neg_one_to_one, unnormalize_to_zero_to_one
 from Data.build_dataloader import build_dataloader, build_dataloader_cond
 
 def set_seed(seed):
@@ -93,9 +89,21 @@ if __name__ == "__main__":
     real = test_scaled
     test_dataset = test_dataloader_info['dataset']
     test_dataloader = test_dataloader_info['dataloader']
-    sample, real_ = trainer.sample_forecast(test_dataloader, shape=[seq_len, feat_num])
-    mask = test_dataset.masking
-    mse = mean_squared_error(sample.reshape(-1), real_.reshape(-1))
-    mae = mean_absolute_error(sample.reshape(-1), real_.reshape(-1))
-    print(mse,mae)
+    # Paper: metrics averaged over 10 sampling runs (deterministic fast_sample -> identical runs).
+    mse_runs, mae_runs = [], []
+    for run in range(10):
+        torch.manual_seed(2023 + run)
+        np.random.seed(2023 + run)
+        random.seed(2023 + run)
+        sample, real_ = trainer.sample_forecast(test_dataloader, shape=[seq_len, feat_num])
+        mse_runs.append(mean_squared_error(sample.reshape(-1), real_.reshape(-1)))
+        mae_runs.append(mean_absolute_error(sample.reshape(-1), real_.reshape(-1)))
+    mse, mae = float(np.mean(mse_runs)), float(np.mean(mae_runs))
+    print(mse, mae)
+    cfg_l = args.config_path.replace("\\", "/").lower()
+    if "stock" in cfg_l:
+        print(
+            "Paper reference (Table 1, ARMD on Stock, z-score): MSE=0.235 MAE=0.269 "
+            "(https://arxiv.org/abs/2412.09328)"
+        )
 

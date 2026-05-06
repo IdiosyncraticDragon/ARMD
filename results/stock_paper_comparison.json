@@ -1,0 +1,96 @@
+{
+  "paper_reference": {
+    "source": "https://arxiv.org/abs/2412.09328",
+    "table": "Table 1 (diffusion baselines) / multivariate forecasting on Stock",
+    "stock_armd_mse": 0.235,
+    "stock_armd_mae": 0.269,
+    "notes": [
+      "Metrics in the paper are MSE/MAE on z-score normalized series (main text).",
+      "Supplemental: Adam lr=1e-3, L1 training loss, batch 128, 2000 training iterations, 70/10/20 chronological train/val/test on sliding windows, sampling steps chosen from {1..12} using the validation split."
+    ]
+  },
+  "local_data": {
+    "csv_path": "Data/datasets/stock_data.csv",
+    "shape_rows_cols": [3685, 6],
+    "comment": "Full Diffusion-TS-style stock CSV used by this repo (no date column; 6 numeric columns)."
+  },
+  "full_data_paper_style_run_2026": {
+    "config": "Config/stock_paper_full_data_eval.yaml",
+    "hardware_note": "Trained and evaluated on one NVIDIA TITAN RTX; main.py uses cuda when available.",
+    "split": "70/10/20 chronological sliding windows (CustomDataset three_split), train_ratio=0.7, val_ratio=0.1",
+    "training": {
+      "loss_type": "l1",
+      "max_epochs": 2000,
+      "batch_size": 128,
+      "gradient_accumulate_every": 2,
+      "base_lr": 0.001,
+      "sampling_timesteps": 2,
+      "comment": "sampling_timesteps=2 matches validation sweep (see val_sweep_sampling_timesteps); paper selects from {1..12} on val — here ts=2 is optimal on our val split."
+    },
+    "test_metrics_zscore_main_py": {
+      "mse": 0.09365402859583784,
+      "mae": 0.24806230783482391,
+      "protocol": "Same as main.py: 10 repeated evaluations with seeds 2023..2032; fast_sample uses sigma=0 so runs are identical — mean equals a single run."
+    },
+    "delta_vs_paper_table1": {
+      "mse_paper_minus_ours": 0.14134597140416217,
+      "mae_paper_minus_ours": 0.02093769216517609,
+      "interpretation": "MAE is within ~0.021 of the paper (ours lower). MSE is substantially lower here than Table 1 (0.094 vs 0.235), so ranking vs paper is not identical on MSE."
+    }
+  },
+  "val_sweep_sampling_timesteps": {
+    "script": "scripts/sweep_sampling_timesteps_val.py",
+    "checkpoint": "Checkpoints_stock_paper_full_data_96/checkpoint-1.pt (saved at training step 1800 per save_cycle)",
+    "best_by_val_mae": {
+      "sampling_timesteps": 2,
+      "val_mse": 0.0717014776314097,
+      "val_mae": 0.19625450819472057
+    },
+    "note": "ts=1 val_mae ~0.25; ts=2 best; ts>=3 monotonically worse on this val split — consistent with fixing sampling_timesteps=2 in YAML."
+  },
+  "historical_runs_local_gpu": {
+    "repo_stock_yaml_80_20_l2": {
+      "config": "Config/stock.yaml",
+      "split": "80/20 windows (first 80% train, last 20% test)",
+      "loss": "l2",
+      "sampling_timesteps": 1,
+      "mse": 0.06748880594032265,
+      "mae": 0.1815046851637327,
+      "comment": "Not comparable to Table 1: L2 loss, 80/20 split, different difficulty."
+    },
+    "paper_style_70_10_20_l1_ts1": {
+      "config": "Config/stock_paper.yaml (sampling_timesteps=1)",
+      "mse": 0.2798399981888298,
+      "mae": 0.4608747830558631,
+      "comment": "Much worse MAE than ts=2 — sampling_timesteps matters."
+    },
+    "paper_style_70_10_20_l1_ts2": {
+      "config": "Config/stock_paper_ts2.yaml",
+      "mse": 0.09365402859583784,
+      "mae": 0.24806230783482391,
+      "comment": "Same metrics as full_data run — config matches stock_paper_full_data_eval except results_folder path."
+    }
+  },
+  "tutorial_notebook_vs_project_vs_paper": {
+    "standalone_notebook_armd_standalone_full": {
+      "data_split": "Usually 80/20 (divide_windows) unless user edits — paper uses 70/10/20.",
+      "loss": "Often L2 in demo cells — paper uses L1.",
+      "train_steps": "Small max_epochs (e.g. 25) — paper uses 2000 optimizer steps.",
+      "sampling_timesteps": "Often 1 — paper uses validation-selected value (2 on this repo's Stock val).",
+      "metrics_gap_expectation": "Large gaps vs Table 1 are expected unless all of the above match the paper protocol."
+    },
+    "project_code_vs_paper": {
+      "iterations": "Trainer.train_num_steps = YAML max_epochs — 2000 matches supplemental '2000 iterations'.",
+      "metrics_space": "Metrics on StandardScaler-transformed data (global fit on full raw series before windowing) — same broad convention as Diffusion-TS-style baselines; not necessarily identical to every author's internal fork.",
+      "ten_runs": "main.py averages 10 sampling runs; fast_sample sets diffusion sampling noise to 0 — repeats collapse to one deterministic outcome.",
+      "neg_one_to_one_in_yaml": "Ignored in CustomDataset (auto_norm=False) — only z-score applies.",
+      "val_selection": "Paper selects sampling_timesteps on val; repo documents ts=2 from sweep — confirmed by scripts/sweep_sampling_timesteps_val.py on val."
+    },
+    "why_mse_may_still_differ_from_table1": [
+      "Different Stock CSV build or split boundary details vs authors' released Diffusion-TS bundle.",
+      "Possible seed / minor implementation drift between releases.",
+      "Table 1 may aggregate multiple seeds; this repo uses a single training seed (main.py set_seed(2023)).",
+      "EMA/checkpoint: optional evaluation at step 1800 vs final step 2000 — main.py evaluates the final in-memory weights after 2000 steps."
+    ]
+  }
+}

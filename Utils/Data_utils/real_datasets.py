@@ -27,10 +27,21 @@ class CustomDataset(Dataset):
         missing_ratio=None,
         style='separate', 
         distribution='geometric', 
-        mean_mask_length=3
+        mean_mask_length=3,
+        three_split=False,
+        train_ratio=0.7,
+        val_ratio=0.1,
     ):
         super(CustomDataset, self).__init__()
-        assert period in ['train', 'test'], 'period must be train or test.'
+        self.three_split = three_split
+        self.train_ratio = float(train_ratio)
+        self.val_ratio = float(val_ratio)
+        if self.three_split:
+            assert period in ('train', 'val', 'test'), 'with three_split, period must be train, val, or test.'
+            assert self.train_ratio > 0 and self.val_ratio >= 0
+            assert self.train_ratio + self.val_ratio < 1.0 - 1e-9, 'train_ratio + val_ratio must leave a test tail.'
+        else:
+            assert period in ['train', 'test'], 'period must be train or test.'
         if period == 'train':
             assert ~(predict_length is not None or missing_ratio is not None), ''
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
@@ -47,10 +58,18 @@ class CustomDataset(Dataset):
         self.auto_norm = False
 
         self.data = self.__normalize(self.rawdata)
-        train, inference = self.__getsamples(self.data, proportion, seed)
-
-        self.samples = train if period == 'train' else inference
-        if period == 'test':
+        if self.three_split:
+            train_w, val_w, test_w = self.__getsamples_three_split(self.data, seed)
+            if period == 'train':
+                self.samples = train_w
+            elif period == 'val':
+                self.samples = val_w
+            else:
+                self.samples = test_w
+        else:
+            train, inference = self.__getsamples(self.data, proportion, seed)
+            self.samples = train if period == 'train' else inference
+        if period in ('test', 'val'):
             if missing_ratio is not None:
                 self.masking = self.mask_data(seed)
             elif predict_length is not None:
@@ -84,6 +103,27 @@ class CustomDataset(Dataset):
                 np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
 
         return train_data, test_data
+
+    def __getsamples_three_split(self, data, seed):
+        """Chronological 70/10/20 window split (ARMD paper supplemental, Liu et al. / Zhou et al.)."""
+        x = np.zeros((self.sample_num_total, self.window, self.var_num))
+        for i in range(self.sample_num_total):
+            x[i, :, :] = data[i : i + self.window, :]
+
+        n = x.shape[0]
+        t_end = int(np.ceil(n * self.train_ratio))
+        v_end = int(np.ceil(n * (self.train_ratio + self.val_ratio)))
+        train_data, val_data, test_data = x[:t_end], x[t_end:v_end], x[v_end:]
+
+        if self.save2npy:
+            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_train.npy"), self.unnormalize(train_data))
+            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_val.npy"), self.unnormalize(val_data))
+            np.save(os.path.join(self.dir, f"{self.name}_ground_truth_{self.window}_test.npy"), self.unnormalize(test_data))
+            np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
+            np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_val.npy"), val_data)
+            np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_test.npy"), test_data)
+
+        return train_data, val_data, test_data
 
     def normalize(self, sq):
         d = sq.reshape(-1, self.var_num)
@@ -135,10 +175,9 @@ class CustomDataset(Dataset):
         df = pd.read_csv(filepath, header=0)
         if name == 'etth':
             df.drop(df.columns[0], axis=1, inplace=True)
-        data = df.values
-        #scaler = MinMaxScaler()
+        data = df.values.astype(np.float64)
         scaler = StandardScaler()
-        scaler = scaler.fit(data)
+        scaler.fit(data)
         return data, scaler
     
     def mask_data(self, seed=2023):
@@ -161,7 +200,7 @@ class CustomDataset(Dataset):
         return masks.astype(bool)
 
     def __getitem__(self, ind):
-        if self.period == 'test':
+        if self.period in ('test', 'val'):
             x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
             m = self.masking[ind, :, :]  # (seq_length, feat_dim) boolean array
             return torch.from_numpy(x).float(), torch.from_numpy(m)

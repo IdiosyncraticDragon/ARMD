@@ -10,13 +10,13 @@ import numpy as np
 
 
 def load_yaml_config(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         config = yaml.full_load(f)
     return config
 
 def save_config_to_yaml(config, path):
     assert path.endswith('.yaml')
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         f.write(yaml.dump(config))
         f.close()
 
