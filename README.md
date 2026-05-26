@@ -40,7 +40,7 @@ For full parity with the original experiments (GluonTS, MuJoCo, etc.), install `
 
 ### Tutorial: GPU-enabled PyTorch (CUDA 12.4)
 
-[`pyproject.toml`](pyproject.toml) installs **`torch` from PyTorch’s CUDA 12.4 wheel index** (`[[tool.uv.index]]` + `[tool.uv.sources]`), not the CPU-only wheel from PyPI.
+[`pyproject.toml`](pyproject.toml) installs **`torch` from PyTorch’s CUDA 12.4 wheel index** on Linux/Windows (`[[tool.uv.index]]` + `[tool.uv.sources]`), while macOS falls back to the CPU wheel from PyPI.
 
 ```bash
 uv lock
@@ -50,7 +50,7 @@ uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available
 
 Expect a version suffix like `+cu124` and `True` when your NVIDIA driver is working. In Jupyter, pick the kernel that uses **`.venv`** (same interpreter as above).
 
-**CPU-only:** comment out or remove the `[[tool.uv.index]]` block and `[tool.uv.sources]` under `[tool.uv.sources]` in `pyproject.toml`, then run `uv lock` and `uv sync` again.
+**CPU-only on all platforms:** comment out or remove the `[[tool.uv.index]]` block and `[tool.uv.sources]` in `pyproject.toml`, then run `uv lock` and `uv sync` again.
 
 **Broken `torch` after interrupted install** (e.g. `ImportError: FakeWork`): close Jupyter/IDE using the venv, then run `uv sync --reinstall-package torch`.
 
