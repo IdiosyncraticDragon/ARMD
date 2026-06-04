@@ -686,13 +686,11 @@ $$\boxed{X^t_{1-t:T-t} = \mathrm{Slide}\!\left(X^{t-1}_{2-t:T-t+1},\;1\right)} \
 
 ### C-3  Eq.2 —— t 步直接计算中间态
 
-$$\boxed{X^t_{1-t:T-t} = \mathrm{Slide}(X^0_{1:T},\;t) = \sqrt{\bar\alpha_t}\,X^0_{1:T} + \sqrt{1-\bar\alpha_t}\,z_t} \tag{2}$$
+$$\boxed{X^t_{1-t:T-t} = \underbrace{\mathrm{Slide}(X^0_{1:T},\;t)}_{\text{（a）滑动定义}} = \underbrace{\sqrt{\bar\alpha_t}\,X^0_{1:T} + \sqrt{1-\bar\alpha_t}\,z_t}_{\text{（b）扩散式分解}}} \tag{2}$$
 
-类比 DDPM 的 Eq.14：直接从初态 $X^0$ 计算第 $t$ 步，不需要逐步迭代。
+Eq.2 把同一个 $X^t$ 写成了**两种等价形式**，初学者最容易困惑的就是它们怎么对应到代码——下面逐一拆开。
 
-这是代数上的等价改写，$z_t$ 是为了让等式成立而定义的"演化趋势"（见 Eq.3）。
-
-**实现**：`q_sample` 直接切片，不需要显式计算 $\sqrt{\bar\alpha_t}$ 和 $z_t$：
+#### （a）`q_sample` 只实现了"滑动定义"这一半
 
 ```python
 def q_sample(self, x_start, t, noise=None):
@@ -701,35 +699,105 @@ def q_sample(self, x_start, t, noise=None):
     return x_middle
 ```
 
+注意：**代码里压根没有出现 $\sqrt{\bar\alpha_t}$、$z_t$、也没用到 `noise` 参数**。`q_sample` 做的纯粹是按下标切一个窗口，这正是 $\mathrm{Slide}(X^0_{1:T},\,t)$——把"历史+未来"拼接序列 `x_start`（长度 192）向历史方向滑 `index` 步后，取出长度 96 的窗口。
+
 以 `pred_len=96` 为例：
 - `t_code=0, index=1`：切 `x_start[:, 95:191, :]`（含1步历史+95步未来）
 - `t_code=47, index=48`：切 `x_start[:, 48:144, :]`（各48步混合）
 - `t_code=95, index=96`：切 `x_start[:, 0:96, :]`（完整历史）
 
+#### （b）"扩散式分解"那一半在代码里是怎么体现的？
+
+关键点（也是仅看 `q_sample` 看不出来的地方）：**ARMD 从不用右边的公式 $\sqrt{\bar\alpha_t}X^0+\sqrt{1-\bar\alpha_t}z_t$ 去"生成" $X^t$。** 计算方向恰好和 DDPM 相反：
+
+| | DDPM（Eq.14） | ARMD（Eq.2） |
+|---|---|---|
+| 第 1 步 | 先**采样**噪声 $\varepsilon\sim\mathcal N(0,I)$ | 先**滑动**得到 $X^t$（`q_sample`） |
+| 第 2 步 | 再算 $X^t=\sqrt{\bar\alpha_t}X^0+\sqrt{1-\bar\alpha_t}\varepsilon$ | 再**反解**出 $z_t$（见 Eq.3） |
+| 谁是已知量 | $\varepsilon$ 是输入，$X^t$ 是输出 | $X^t$ 是输入，$z_t$ 是输出 |
+
+所以右半边 $\sqrt{\bar\alpha_t}X^0+\sqrt{1-\bar\alpha_t}z_t$ **不是一段计算 $X^t$ 的代码**，而是一个**恒等式约束**：我们把已经切好的 $X^t$ 强行拆成"已知未来初态 $X^0$ 的缩放" + "一段残差"，其中缩放系数 $\sqrt{\bar\alpha_t},\sqrt{1-\bar\alpha_t}$ 由 beta schedule 事先固定，剩下的残差就**定义**为 $z_t$（演化趋势）。换句话说：
+
+$$z_t \;\overset{\text{定义}}{=}\; \frac{X^t - \sqrt{\bar\alpha_t}\,X^0}{\sqrt{1-\bar\alpha_t}} \;\;\Longrightarrow\;\; \sqrt{\bar\alpha_t}X^0+\sqrt{1-\bar\alpha_t}z_t \equiv X^t\ \text{（恒成立）}$$
+
+这一步**在 `q_sample` 里没有，而是落在 `_train_loss` 里**（下一节 Eq.3 给出对应代码）。也就是说，Eq.2 的（b）形式 = `q_sample` 的切片输出（a） + `_train_loss` 里 $z_t$ 的定义，两段代码合起来才完整对应 Eq.2。
+
+> **为什么要费劲写成（b）形式？** 因为网络要预测的不是 $X^t$（它能直接切出来），而是这段残差 $z_t$（Eq.7 的回归目标）。把 $X^t$ 分解成"已知部分 + 残差"，才能定义出一个有意义的、随 $t$ 归一化的学习目标 $z_t$，并复用 DDIM 的采样公式（Eq.8–10）。
+
 ### C-4  Eq.3 —— 真实演化趋势 $z_t$
 
-由 Eq.2 反解：
+把上面的"定义"整理成论文形式（分子分母同除以 $\sqrt{\bar\alpha_t}$）：
 
-$$\boxed{z_t = \frac{\sqrt{1/\bar\alpha_t}\,X^t_{1-t:T-t} - X^0_{1:T}}{\sqrt{1/\bar\alpha_t - 1}}} \tag{3}$$
+$$\boxed{z_t = \frac{X^t_{1-t:T-t} - \sqrt{\bar\alpha_t}\,X^0_{1:T}}{\sqrt{1-\bar\alpha_t}} = \frac{\sqrt{1/\bar\alpha_t}\,X^t_{1-t:T-t} - X^0_{1:T}}{\sqrt{1/\bar\alpha_t - 1}}} \tag{3}$$
 
-在 `_train_loss` 中，这对应：
+这正是把 Eq.2（b）反解出 $z_t$ 的结果——所以 Eq.2 和 Eq.3 是**同一个等式的两种摆放**，而 `q_sample`（给 $X^t$）+ Eq.3（给 $z_t$）合在一起，才把 Eq.2 完整落实到代码。
+
+在 `_train_loss` 中，这对应（这就是 Eq.2 的（b）半在代码里真正出现的位置）：
 
 ```python
-# x      = q_sample 输出 = X^t_{1-t:T-t}   shape: (B, 96, 6)
+# x      = q_sample 输出 = X^t_{1-t:T-t}   shape: (B, 96, 6)   ← Eq.2(a) 切片结果
 # target = X^0_{1:T} = 真实未来             shape: (B, 96, 6)
-# alpha  = sqrt(alpha_bar_t)
-# minus_alpha = sqrt(1 - alpha_bar_t)
+# alpha       = sqrt(alpha_bar_t)           ← Eq.2(b) 的 √ᾱ_t
+# minus_alpha = sqrt(1 - alpha_bar_t)       ← Eq.2(b) 的 √(1-ᾱ_t)
 
-target_noise = (x - target * alpha) / minus_alpha
-# 等价于 Eq.3: (sqrt(1/abar) * x - target) / sqrt(1/abar - 1)
-# 证明：令 a = sqrt(abar_t)，则:
-#   (x - target*a) / sqrt(1-abar_t)
-#   = (a*X^0 + sqrt(1-abar)*z - a*X^0) / sqrt(1-abar)   (由 Eq.2 代入)
-#   = z   ✓
+target_noise = (x - target * alpha) / minus_alpha     # ← 这一行就是 Eq.3 / Eq.2(b) 反解
+# 证明它与 Eq.3 一致：令 a = sqrt(abar_t)，则
+#   target_noise = (x - X^0 * a) / sqrt(1-abar)
+# 反过来代回去就得到 Eq.2(b):
+#   a*X^0 + sqrt(1-abar)*target_noise
+#   = a*X^0 + sqrt(1-abar) * (x - a*X^0)/sqrt(1-abar)
+#   = a*X^0 + (x - a*X^0) = x = X^t   ✓ （恒等式，对任意 X^0 都成立）
 ```
-"""))
 
-    C.append(md_cell("### C-5  交互验证：`q_sample` 滑动过程可视化"))
+下一个代码单元用真实股票窗口做**数值验证**：用 Eq.3 从切片 $X^t$ 反解 $z_t$，再用 Eq.2(b) 重建，确认结果与原始切片逐元素相等。
+
+### C-5  数值验证：Eq.2 的两种形式逐元素相等
+"""))
+    C.append(py_cell('''\
+import torch
+
+# 复用 ARMD 的 schedule 系数（cosine, T=96），独立复算一遍以便本节自包含
+def _cosine_abar(timesteps=96, s=0.008):
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+    ac = torch.cos(((x / timesteps) + s) / (1 + s) * 3.141592653589793 * 0.5) ** 2
+    ac = ac / ac[0]
+    betas = torch.clip(1 - (ac[1:] / ac[:-1]), 0, 0.999)
+    alphas = 1.0 - betas
+    return torch.cumprod(alphas, dim=0)            # alphas_cumprod, shape (96,)
+
+PRED_LEN = 96
+abar = _cosine_abar(PRED_LEN)
+
+win0 = torch.from_numpy(train_ds[0].numpy()).double()   # (192, 6) 一个训练窗口
+X0   = win0[PRED_LEN:, :]                                # X^0_{1:T} 真实未来 (96, 6)
+
+print(f"{'t_code':>6} {'index':>5} {'切片==Slide':>11} {'Eq2(b)重建误差':>15}")
+for t_code in [0, 23, 47, 71, 95]:
+    index = t_code + 1                                   # 论文 t = t_code+1
+
+    # —— Eq.2(a)：q_sample 的滑动切片 —— 这就是 X^t
+    Xt = win0[PRED_LEN-index : (-index if index>0 else None), :]   # (96, 6)
+
+    # —— Eq.3：从 X^t 反解 z_t（= _train_loss 里的 target_noise）——
+    a  = abar[t_code].sqrt()
+    ma = (1 - abar[t_code]).sqrt()
+    z_t = (Xt - X0 * a) / ma
+
+    # —— Eq.2(b)：用 √ᾱ·X^0 + √(1-ᾱ)·z_t 重建，应当 == Xt ——
+    Xt_rebuilt = a * X0 + ma * z_t
+    err = (Xt_rebuilt - Xt).abs().max().item()
+
+    same_as_slide = torch.allclose(Xt, win0[PRED_LEN-index:PRED_LEN-index+PRED_LEN, :])
+    print(f"{t_code:>6} {index:>5} {str(same_as_slide):>11} {err:>15.2e}")
+
+print("\\n结论：")
+print(" • Eq.2(a) 切片 = q_sample 的输出，纯下标操作，无系数、无随机数；")
+print(" • Eq.3 用 √ᾱ、√(1-ᾱ) 把该切片反解为 z_t（_train_loss 的 target_noise）；")
+print(" • Eq.2(b) 重建误差≈机器精度(1e-15) ⇒ 两种形式确为同一 X^t 的恒等改写。")
+'''))
+
+    C.append(md_cell("### C-6  交互可视化：`q_sample` 滑动过程"))
     C.append(py_cell('''\
 import matplotlib.pyplot as plt
 import numpy as np
@@ -812,42 +880,135 @@ x_tmp = self.linear(input_.permute(0, 2, 1)).permute(0, 2, 1)
 
 $$\boxed{\hat X^0(X^t, t, \theta) = \frac{W(t) \cdot X^t_{1-t:T-t} + (1-b\,W(t))\cdot D}{(1 + c\,W(t))^d}} \tag{5}$$
 
-**代码实现**（b=2, c=−1, d=1/2 硬编码）：
+`Linear.forward` 的完整代码只有几行，但**几乎每一行都和公式对不上**，是除 `q_sample` 外第二个"看代码读不出公式"的地方。逐行拆开：
 
 ```python
-alpha  = self.w[t[0]]      # W(t)：可学习权重（初始化为 alpha_bar_t）
-output = (alpha * input_ + (1 - 2*alpha) * x_tmp) / (1 - 1*alpha)**(1/2)
+def forward(self, input_, t, training=True):
+    noise = torch.randn_like(input_)
+    if not training:
+        noise = 0
+    input_ += self.w_dev[t[0]] * noise                          # ←(1) 公式 Eq.5 里没有这一项
+    x_tmp = self.linear(input_.permute(0,2,1)).permute(0,2,1)   # ←(2) 这才是 Eq.4 的 D
+    alpha = self.w[t[0]]                                          # ←(3) 此 alpha = W(t)，不是扩散 √ᾱ！
+    output = (alpha*input_ + (1-2*alpha)*x_tmp) / (1-1*alpha)**(1/2)   # ←(4) Eq.5
+    return output.to(torch.float32)
 ```
 
-代入 b=2, c=−1, d=1/2 验证：
-$$\frac{W(t)\cdot X^t + (1-2W(t))\cdot D}{(1-W(t))^{1/2}} \;\checkmark$$
+#### （3）致命的变量名冲突：`alpha` 在这里是 $W(t)$，不是 $\sqrt{\bar\alpha_t}$
+
+这是初学者最容易踩的坑。**同一个名字 `alpha` 在两个文件里含义完全不同**：
+
+| 位置 | `alpha` 指代 | 数值来源 |
+|---|---|---|
+| `linear.py` 的 `forward` | $W(t)$（可学习权重） | `self.w[t[0]]`，**linear schedule** 的 $\bar\alpha$ |
+| `armd.py` 的 `_train_loss` | $\sqrt{\bar\alpha_t}$（扩散系数） | `self.sqrt_alphas_cumprod[t[0]]`，**cosine schedule** |
+
+读 Eq.5 时，公式里的 $W(t)$ 对应代码里的 `alpha`；而 Eq.2/3/6 里的 $\bar\alpha_t$ 是另一套数（见 D-3 的双 schedule 说明）。**两者不要混为一谈。**
+
+#### （4）把硬编码常数代回 Eq.5
+
+代码里 `b=2, c=−1, d=1/2` 被直接写死。代入 Eq.5：
+
+$$\frac{W(t)\cdot X^t + (1-b\,W(t))\cdot D}{(1+c\,W(t))^d}\Bigg|_{b=2,\,c=-1,\,d=1/2} = \frac{W(t)\cdot X^t + (1-2W(t))\cdot D}{(1-W(t))^{1/2}} \;\checkmark$$
+
+与代码 `(alpha*input_ + (1-2*alpha)*x_tmp) / (1-1*alpha)**(1/2)` 逐项一致（`input_`=$X^t$，`x_tmp`=$D$）。
+
+> ⚠️ 因为 $d=1/2$、分母是 $(1-W(t))^{1/2}$，所以 **$W(t)$ 必须 $<1$**，否则开方出 NaN。$W(t)$ 初始化为 $\bar\alpha_t<1$，但它是可学习参数（`w_grad=True`），训练中无约束——这是代码隐含的数值前提，公式里看不出来。
 
 **W(t) 的物理含义**：
 - $t$ 大（中间态接近历史）→ $W(t)$ 小 → 更依赖 $D$（距离估计）
 - $t$ 小（中间态接近未来）→ $W(t)$ 大 → 更依赖输入 $X^t$ 本身
-- $W(t)$ 初始化为 $\bar\alpha_t$（随 $t$ 增大而递减），训练时可更新（`w_grad=True`）
 
-### D-3  训练时小扰动（Supplemental: Deviation）
+### D-3  训练时小扰动（Supplemental: Deviation）—— 代码第 (1) 行，Eq.5 里没有
 
-论文补充材料描述：训练时给输入 $X^t$ 加一个小扰动：
+`forward` 第一段在做 Eq.5 之前，先给输入加了一项扰动——**这一项在 Eq.5 中完全不存在**，属于论文补充材料里的训练 trick：
 
-$$X^t_{\text{input}} = X^t + \eta_{0:t} \cdot \varepsilon, \quad \varepsilon \sim \mathcal{N}(0,I)$$
-
-其中 $\eta_{0:t} = \bar\alpha_t$（与 Eq.13 相同），使用 **cosine schedule**（与 `w_dev` 对应）。
-
-**设计逻辑**：$t$ 大（接近历史终态）时 $\bar\alpha_t$ 较小 → 扰动小 → 保持稳定；$t$ 小（接近未来初态）时 $\bar\alpha_t$ 较大 → 扰动大 → 增加多样性。
-
-代码：
+$$X^t_{\text{input}} = X^t + \eta_t \cdot \varepsilon, \quad \varepsilon \sim \mathcal{N}(0,I)$$
 
 ```python
 noise = torch.randn_like(input_)
 if not training:
-    noise = 0   # 推理时关闭扰动！
-input_ += self.w_dev[t[0]] * noise   # self.w_dev 使用 cosine schedule
+    noise = 0                          # 推理时关闭扰动 → forward 退化为纯 Eq.5
+input_ += self.w_dev[t[0]] * noise     # 扰动系数 = w_dev[t]
 ```
 
-**注意**：`w_dev` 使用 **cosine schedule**（由 `cosine_beta_schedule` 初始化，`alphas_dev = 1 - betas_cos`），而可学习权重 `w` 使用 **linear schedule**（由 `linear_beta_schedule` 初始化）。这是两个不同 schedule 的刻意设计。
+这里有**三个**只看公式发现不了、必须读代码（甚至要动手验证）才知道的实现细节：
 
+#### （1）扰动系数 `w_dev` 是"逐步 $\alpha=1-\beta$"，不是累积 $\bar\alpha_t$
+
+很容易想当然地以为 $\eta_t=\bar\alpha_t$（和 Eq.13 一样），但代码里：
+
+```python
+self.betas_dev  = cosine_beta_schedule(96)      # cosine 的 beta
+self.alphas_dev = 1. - self.betas_dev           # 逐步 alpha，注意：没有 cumprod！
+self.w_dev      = Parameter(alphas_dev, requires_grad=False)
+```
+
+`w_dev[t] = 1 - β_t`（**单步**），而非累积乘积 $\bar\alpha_t=\prod_{k\le t}\alpha_k$。两者数值差异很大：
+
+| $t$ | `w_dev[t] = 1-β_t`（代码实际用） | $\bar\alpha_t$（累积，对比） |
+|---|---|---|
+| 0  | 0.999 | 0.999 |
+| 47 | **0.968** | 0.494 |
+| 95 | 0.001 | ≈0 |
+
+所以扰动幅度在大半个 $t$ 区间都接近 1（不小！），只有在 $t\to95$（最接近历史终态）时才骤降到 0。**定性**结论（$t$ 大→扰动小、$t$ 小→扰动大）仍成立，但**定量**上和"$\bar\alpha_t$"完全不同——这是代码与论文符号的一处出入，按代码为准。
+
+#### （2）`input_ += ...` 是原地修改，且会"串改" target（真实的 in-place 别名陷阱）
+
+`+=` 是 in-place 操作，直接改写传入张量的底层存储。而传入的 `input_` 正是 `_train_loss` 里 `x = q_sample(...)` 的**切片视图**，它和回归目标 `target = x_start[:, 96:, :]` **共享同一块 `x_start` 存储且区间重叠**。实测：当 `t_code=0` 时，这一行 `+=` 会改动 `target` 96 个元素中的 95 个。
+
+```python
+# _train_loss 内部，两者都是 x_start 的视图：
+target = x_start[:, 96:, :]               # 覆盖 x_start[96:192]
+x      = x_start[:, 96-index:-index, :]   # 覆盖 x_start[96-index:192-index]，与 target 重叠
+model_out = self.output(x, ...)           # 内部 x += w_dev*noise → 同时改了 target 重叠段
+```
+
+也就是说，**训练时回归目标本身也被这股扰动"染"了一点**。这是已发布代码的真实行为（不是笔记本的改写），它仍能复现论文指标，但属于"公式上看不出、且容易踩坑"的实现细节。如果你自己改写 `_train_loss`，想避免别名，可在 `q_sample` 里 `return x_middle.clone()` 或在 `forward` 用 `input_ = input_ + ...`（非原地）。推理时 `noise=0`，`input_ += 0` 不改值，等价于跳过，无此问题。
+
+> 下一个代码单元会**实测**这个别名效应，亲眼看到 `target` 被改了多少个元素。
+
+#### （3）三套同名 $\alpha$，务必区分
+
+| 名字/出处 | 含义 | schedule | 是否 cumprod |
+|---|---|---|---|
+| `linear.py` `self.w` → `alpha` | $W(t)$ 加权权重 | **linear** | 是（`alphas_cumprod`）|
+| `linear.py` `self.w_dev` | 扰动系数 $\eta_t$ | **cosine** | **否**（`1-β`）|
+| `armd.py` `sqrt_alphas_cumprod` 等 | 扩散 $\sqrt{\bar\alpha_t}$ | **cosine** | 是 |
+
+三处都叫 "alpha/α"，但 schedule 不同、是否累积也不同——这是读 ARMD 源码最大的混淆源，记住这张表即可。"""))
+
+    C.append(md_cell("### D-3b  实测：in-place 扰动对 target 的别名影响"))
+    C.append(py_cell('''\
+import torch
+
+# 复现 _train_loss 中的视图别名：x 与 target 都是 x_start 的切片视图
+pred_len = 96
+x_start = torch.arange(192, dtype=torch.float32).reshape(1, 192, 1).clone()
+
+target = x_start[:, pred_len:, :]                 # 真实未来 X^0，覆盖 x_start[96:192]
+print("x 是 x_start 的视图吗? ", x_start[:, 0:96, :].data_ptr() == x_start.data_ptr())
+
+for t_code in [0, 47, 95]:
+    xs = x_start.clone()                          # 每次重置
+    tgt = xs[:, pred_len:, :]
+    tgt_before = tgt.clone()
+    index = t_code + 1
+    x = xs[:, pred_len-index:(-index if index>0 else None), :]   # q_sample 切片（视图）
+
+    # 模拟 Linear.forward 第一行：input_ += w_dev*noise（这里用常数 +1000 放大可见）
+    x += 1000.0
+
+    changed = (tgt != tgt_before).sum().item()
+    print(f"t_code={t_code:>2} (index={index:>2}): in-place += 改动了 target {changed}/{tgt.numel()} 个元素")
+
+print("\\n说明：t_code 越小，x 与 target 的重叠越多，被'串改'的元素越多；")
+print("     t_code=95 时 x=完整历史段，与 target 不重叠，target 不受影响。")
+print("     真实训练里加的是 w_dev*randn（不是+1000），但别名机制相同。")
+'''))
+
+    C.append(md_cell(r"""
 ### D-4  Eq.6 —— 预测演化趋势 $\hat z$
 
 $$\boxed{\hat z(t,\theta) = \frac{\sqrt{1/\bar\alpha_t}\,X^t_{1-t:T-t} - \hat X^0(X^t,t,\theta)}{\sqrt{1/\bar\alpha_t - 1}}} \tag{6}$$
@@ -862,6 +1023,15 @@ def predict_noise_from_start(self, x_t, t, x0):
 # 等价于: (sqrt(1/abar_t) * x_t - x0) / sqrt(1/abar_t - 1)
 # x_t = X^t,  x0 = X_hat^0
 ```
+
+**一处看代码会困惑的地方：同一个 $\hat z$，代码里有两种写法。** ARMD 在两处算 $\hat z$，公式形态完全不同，却是同一个量：
+
+| 出处 | 代码 | 数学形式 |
+|---|---|---|
+| `_train_loss`（D-5） | `(x - model_out*alpha) / minus_alpha` | $\dfrac{X^t-\sqrt{\bar\alpha_t}\,\hat X^0}{\sqrt{1-\bar\alpha_t}}$ |
+| `predict_noise_from_start`（采样用） | `(sqrt_recip*x_t - x0) / sqrt_recipm1` | $\dfrac{\sqrt{1/\bar\alpha_t}\,X^t-\hat X^0}{\sqrt{1/\bar\alpha_t-1}}$ |
+
+把第二式分子分母同乘 $\sqrt{\bar\alpha_t}$：分子 $\to X^t-\sqrt{\bar\alpha_t}\hat X^0$，分母 $\to\sqrt{\bar\alpha_t}\sqrt{1/\bar\alpha_t-1}=\sqrt{1-\bar\alpha_t}$，**两式逐项相等**。即 `_train_loss` 用的是 Eq.6 的等价改写，`predict_noise_from_start` 用的是 Eq.6 的原式——同一个 $\hat z$。（C-6 后的验证单元会顺带数值确认这一点。）
 
 **`extract` 函数的作用**（初学者必读）：
 
@@ -878,6 +1048,8 @@ def extract(a, t, x_shape):
 
 示例：`t = [47, 47, 47]`（B=3，相同时间步），`a[47] = 1.23`
 → `extract(a, t, (3,96,6))` 返回形状 `(3, 1, 1)` 的张量 `[[[1.23]], [[1.23]], [[1.23]]]`。
+
+> **为什么 `_train_loss` 用 `self.X[t[0]]` 标量索引，这里却用 `extract(...)`？** 两者等价：因为 `forward` 里 `t = randint(...).repeat(b)` 让整个 batch 共享同一个 $t$，所以 `self.sqrt_alphas_cumprod[t[0]]` 取一个标量、靠广播作用到整个 batch；`extract` 则显式 gather 成 `(B,1,1)`。同一份系数，两种取法，结果相同。
 """))
 
     C.append(md_cell(r"""
@@ -913,8 +1085,58 @@ def _train_loss(self, x_start, t, target=None, noise=None, training=True):
     return train_loss.mean()
 ```
 
-**loss_weight**：`sqrt(alpha_t) * sqrt(1-alpha_bar_t) / (beta_t * 100)`，对不同时间步的 loss 做加权，使训练更稳定（论文未单独展开，但代码中保留）。
+#### 关键：Eq.7 写成"对 noise 的 L1"，但代码其实是"对 $\hat X^0$ 的加权 L1"
+
+这是又一个"只看公式 Eq.7 看不出、必须读代码才懂"的点。`target_noise` 和 `pred_noise` 共用同一个 $X^t$、同一组系数，只有 $X^0$/$\hat X^0$ 不同。相减时 $X^t$ 整项抵消：
+
+$$z_t - \hat z = \frac{X^t-\sqrt{\bar\alpha_t}X^0}{\sqrt{1-\bar\alpha_t}} - \frac{X^t-\sqrt{\bar\alpha_t}\hat X^0}{\sqrt{1-\bar\alpha_t}} = \frac{\sqrt{\bar\alpha_t}}{\sqrt{1-\bar\alpha_t}}\,(\hat X^0 - X^0)$$
+
+所以 Eq.7 的 $|z_t-\hat z|$ **等价于对 $\hat X^0$ 的回归**，只是带了一个随 $t$ 变化的系数 $\dfrac{\sqrt{\bar\alpha_t}}{\sqrt{1-\bar\alpha_t}}$：
+
+$$\big|z_t-\hat z\big| = \underbrace{\frac{\sqrt{\bar\alpha_t}}{\sqrt{1-\bar\alpha_t}}}_{\text{系数①（相减自带）}}\;\big|\hat X^0 - X^0\big|$$
+
+而代码**之后又乘了一次** `loss_weight`：
+
+$$\mathcal L \;=\; \underbrace{\frac{\sqrt{\alpha_t}\,\sqrt{1-\bar\alpha_t}}{100\,\beta_t}}_{\text{系数②（loss\_weight）}}\;\times\;\underbrace{\frac{\sqrt{\bar\alpha_t}}{\sqrt{1-\bar\alpha_t}}\big|\hat X^0-X^0\big|}_{\text{= }|z_t-\hat z|}$$
+
+两个系数相乘，$\sqrt{1-\bar\alpha_t}$ 约掉，最终对 $|\hat X^0-X^0|$ 的**总有效权重**是 $\dfrac{\sqrt{\alpha_t}\sqrt{\bar\alpha_t}}{100\,\beta_t}$。**这个"双重加权"在 Eq.7 里完全看不出来**——公式只写了 $|z_t-\hat z|$，而代码里 (a) 相减自带系数① + (b) 显式乘 `loss_weight` 系数②。
+
+要点：
+- 网络 `model_out` 实际学的是 **$\hat X^0$**（未来初态），不是直接学 noise；"预测 noise"只是 Eq.7 的书写形式。
+- `loss_weight = sqrt(alpha_t)*sqrt(1-alpha_bar_t)/beta_t/100` 里的 `/100` 纯是缩放常数（论文未展开），其余因子用来平衡不同 $t$ 的 loss 量级。
+
+> 下一个代码单元用真实张量**数值验证**：直接算的 `l1_loss(pred_noise,target_noise)` 与 `(√ᾱ/√(1-ᾱ))·|X̂⁰-X⁰|` 逐元素相等。
 """))
+
+    C.append(md_cell("### D-5b  数值验证：Eq.7 的 noise-loss = 加权的 $\\hat X^0$-loss"))
+    C.append(py_cell('''\
+import torch
+
+torch.manual_seed(0)
+B = 4
+abar_t = torch.tensor(0.4938)          # 取 t_code=47 的 cosine bar_alpha 作示例
+a  = abar_t.sqrt()                     # √ᾱ_t
+ma = (1 - abar_t).sqrt()               # √(1-ᾱ_t)
+
+Xt        = torch.randn(B, 96, 6)      # X^t（任意）
+X0        = torch.randn(B, 96, 6)      # 真实未来 X^0
+X0_hat    = torch.randn(B, 96, 6)      # 网络预测 \\hat X^0
+
+# —— 按 _train_loss 的写法：先转成 noise，再 L1 ——
+target_noise = (Xt - X0     * a) / ma          # z_t   (Eq.3 变形)
+pred_noise   = (Xt - X0_hat * a) / ma          # \\hat z (Eq.6 变形)
+loss_as_noise = (pred_noise - target_noise).abs()
+
+# —— 解析等价：|z - ẑ| == (√ᾱ/√(1-ᾱ)) * |X̂⁰ - X⁰| ——
+loss_as_x0 = (a / ma) * (X0_hat - X0).abs()
+
+print("两种算法逐元素最大差:", (loss_as_noise - loss_as_x0).abs().max().item())
+print("→ ≈0 说明：对 noise 的 L1 = (√ᾱ/√(1-ᾱ)) × 对 X̂⁰ 的 L1（系数①）")
+print()
+print(f"系数① √ᾱ/√(1-ᾱ) (t=47) = {(a/ma).item():.4f}")
+print("再乘 loss_weight=√α_t·√(1-ᾱ_t)/(100·β_t)（系数②）后，√(1-ᾱ) 约掉，")
+print("对 |X̂⁰-X⁰| 的总有效权重 = √α_t·√ᾱ_t/(100·β_t)。")
+'''))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Part E: 采样 Eq.8-10
@@ -997,6 +1219,41 @@ def fast_sample(self, x, clip_denoised=True):
 | 用 $R(\cdot)$ 得到 $\hat X^0$, $\hat z$ | `x_start, pred_noise = model_predictions(img, t)` |
 | Eq.(10) 更新 | `img = x_start * alpha_next.sqrt() + c * pred_noise` |
 | 输出 $X^0_{1:T}$ | `return img` |
+
+### E-4  `fast_sample` 里几处"公式上看不出"的实现细节
+
+和 `q_sample` 一样，`fast_sample` 有几行代码无法和 Eq.8–10 直接对上，逐一说明：
+
+**(1) 更新式 `img = x_start*alpha_next.sqrt() + c*pred_noise` 怎么就是 Eq.10？**
+
+代码变量到公式的映射（注意 `sigma=0` 被硬编码）：
+
+| 代码 | 公式（Eq.10，$\sigma=0$） |
+|---|---|
+| `x_start` | $\hat X^0(X^t,t,\theta)$（`model_predictions` 返回） |
+| `pred_noise` | $\hat z(t,\theta)$（即 `predict_noise_from_start` 的输出） |
+| `alpha_next.sqrt()` | $\sqrt{\bar\alpha_{t-k}}$ |
+| `c = (1-alpha_next-sigma**2).sqrt()` | $\sqrt{1-\bar\alpha_{t-k}-\sigma_t^2}\xrightarrow{\sigma=0}\sqrt{1-\bar\alpha_{t-k}}$ |
+
+代回：`x_start*√ᾱ_next + √(1-ᾱ_next)*pred_noise` $=\sqrt{\bar\alpha_{t-k}}\hat X^0+\sqrt{1-\bar\alpha_{t-k}}\hat z$ ＝ Eq.10。✓ 注意 Eq.8 方括号内"$\frac{X^t-\sqrt{1-\bar\alpha_t}\hat z}{\sqrt{\bar\alpha_t}}$"在代码里**不再出现**——因为它恒等于 $\hat X^0$，而 `model_predictions` 已直接给出 $\hat X^0$（`x_start`），无需再算方括号。这正是 DDIM 把反向步重写成"$\hat X^0$ + $\hat z$ 线性组合"的好处。
+
+**(2) `pred_noise`/`alpha_next` 的时间索引：这里直接用 `time`/`time_next`，没有 `q_sample` 的 +1**
+
+`q_sample` 切片用 `index=t_code+1`，但这里 `self.alphas_cumprod[time_next]`、`model_predictions(img, time)` 都是**直接拿 `time` 当下标**，没有 +1。看似矛盾，其实一致：`q_sample` 的 `+1` 是把"论文步 $t$"换算成"滑动几步"（滑 $t$ 步要从拼接序列偏移 $t$）；而系数数组 `alphas_cumprod` 是 0-based，`alphas_cumprod[time]` 恰好就是论文第 $time{+}1$ 步的 $\bar\alpha$。两处最终都指向同一个论文步，只是一个数"滑动步数"、一个数"数组下标"。
+
+**(3) `times = linspace(-1, T-1, steps=k+1)` 里的 `-1` 是什么？**
+
+```python
+times = torch.linspace(-1, self.num_timesteps - 1, steps=self.sampling_timesteps + 1)
+times = list(reversed(times.int().tolist()))     # 例: k=2 → [95, 47, -1]
+time_pairs = list(zip(times[:-1], times[1:]))     # → [(95,47), (47,-1)]
+```
+
+末尾的 `-1` 是个**哨兵值**：当 `time_next < 0`（最后一对），说明已经走到序列最前端，此时不再做 Eq.10 的线性组合，而是 `img = x_start` 直接输出 $\hat X^0$（见代码 `if time_next < 0`）。这一步在 Algorithm 2 里对应"循环结束、输出 $X^0_{1:T}$"，公式 Eq.10 本身没有体现这个边界处理。
+
+**(4) 起点是历史，不是高斯噪声**
+
+`img = x[:, :pred_len, :]`（注意源码里 `img = torch.randn(...)` 那行被注释掉了）。这是 ARMD 区别于普通扩散模型的本质：采样链起点 $X^T$ ＝**已知的历史序列**，而非 $\mathcal N(0,I)$，所以只需极少步（本教程 `sampling_timesteps=2`）即可。
 """))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1589,10 +1846,7 @@ print(mse, mae)
 - [ ] **`w_grad=True`**：W(t) 可学习（不要固定为 alpha_bar_t）
 """))
 
-    # ── assign cell IDs ───────────────────────────────────────────────────────
-    for i, c in enumerate(nb.cells):
-        c.setdefault("id", f"cell{i:03d}")
-
+    # 不写入显式 cell id（与 macOS / 新版 nbformat 兼容；由 nbformat 按需生成）
     nbformat.write(nb, OUT)
     print(f"Wrote {OUT}")
     print(f"Total cells: {len(nb.cells)}")
