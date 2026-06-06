@@ -31,11 +31,13 @@ class CustomDataset(Dataset):
         three_split=False,
         train_ratio=0.7,
         val_ratio=0.1,
+        norm_on_train=False,
     ):
         super(CustomDataset, self).__init__()
         self.three_split = three_split
         self.train_ratio = float(train_ratio)
         self.val_ratio = float(val_ratio)
+        self.norm_on_train = norm_on_train
         if self.three_split:
             assert period in ('train', 'val', 'test'), 'with three_split, period must be train, val, or test.'
             assert self.train_ratio > 0 and self.val_ratio >= 0
@@ -47,6 +49,15 @@ class CustomDataset(Dataset):
         self.name, self.pred_len, self.missing_ratio = name, predict_length, missing_ratio
         self.style, self.distribution, self.mean_mask_length = style, distribution, mean_mask_length
         self.rawdata, self.scaler = self.read_data(data_root, self.name)
+        if self.norm_on_train:
+            # Informer/Autoformer convention: fit z-score statistics on the training
+            # raw region only, so test-period scale never leaks into normalization.
+            # The boundary is the same for every period (train/val/test) instance, so
+            # all of them share one consistent normalization. Uses train_ratio (the
+            # chronological three_split fraction); pair with three_split: True.
+            n_total = self.rawdata.shape[0]
+            train_end = int(n_total * self.train_ratio)
+            self.scaler = StandardScaler().fit(self.rawdata[:train_end])
         self.dir = os.path.join(output_dir, 'samples')
         os.makedirs(self.dir, exist_ok=True)
 

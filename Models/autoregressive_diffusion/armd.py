@@ -52,6 +52,7 @@ class ARMD(nn.Module):
             attn_pd=0.,
             resid_pd=0.,
             w_grad=True,
+            use_revin=False,
             **kwargs
     ):
         super(ARMD, self).__init__()
@@ -59,6 +60,10 @@ class ARMD(nn.Module):
         self.eta = eta
         self.seq_length = seq_length
         self.feature_size = feature_size
+        # RevIN: normalize each window by its OWN lookback (context) statistics so a
+        # trending series becomes per-window stationary. Stats are re-applied to the
+        # prediction so metrics stay in the outer-scaler space. Off by default.
+        self.use_revin = use_revin
 
         self.model = Linear(n_feat=feature_size, n_channel=seq_length, w_grad=w_grad, **kwargs)
 
@@ -213,8 +218,19 @@ class ARMD(nn.Module):
 
         return img
 
+    def _revin_stats(self, x, eps=1e-5):
+        """Per-window mean/std over the lookback (context) portion x[:, :pred_len, :]."""
+        ctx = x[:, :pred_len, :]
+        mu = ctx.mean(dim=1, keepdim=True)
+        sigma = torch.sqrt(ctx.var(dim=1, keepdim=True, unbiased=False) + eps)
+        return mu, sigma
+
     def generate_mts(self, x):
         sample_fn = self.fast_sample if self.fast_sampling else self.sample
+        if self.use_revin:
+            mu, sigma = self._revin_stats(x)
+            pred = sample_fn((x - mu) / sigma)   # predict in per-window normalized space
+            return pred * sigma + mu             # de-normalize back to outer-scaler space
         return sample_fn(x)
 
     @property
@@ -252,6 +268,10 @@ class ARMD(nn.Module):
     def forward(self, x, **kwargs):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
         assert n == feature_size, f'number of variable must be {feature_size}'
+        if self.use_revin:
+            # Train in the same per-window normalized space the sampler predicts in.
+            mu, sigma = self._revin_stats(x)
+            x = (x - mu) / sigma
         t = torch.randint(0, self.num_timesteps, (1,), device=device).repeat(b).long()
         return self._train_loss(x_start=x, t=t, **kwargs)
 

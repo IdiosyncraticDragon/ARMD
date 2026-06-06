@@ -1,5 +1,10 @@
 # Stock — align with ARMD paper supplemental (arxiv:2412.09328):
 # - 70/10/20 chronological train/val/test on sliding windows (three_split)
+# - Global StandardScaler z-score (norm_on_train: False). NOTE: train-only z-score
+#   overshoots badly here because Stock triples in price (test sits ~5.5 sigma above
+#   the train mean); per-window RevIN handles that drift instead — see use_revin below.
+# - use_revin: True — normalize each window by its own lookback stats, re-applied to
+#   the prediction so metrics stay in outer-scaler space.
 # - Adam lr 1e-3, L1 loss, 2000 training iterations, batch 128 (same as other benchmarks in paper)
 # - sampling_timesteps: paper selects from {1..12} on the validation split; a quick local sweep
 #   (same 70/10/20 + L1 + 2000 iters) gave much closer MAE with 2 than with 1 — adjust if you reproduce val search.
@@ -15,6 +20,7 @@ model:
     loss_type: 'l1'
     beta_schedule: 'cosine'
     w_grad: True
+    use_revin: True   # per-window RevIN (normalize by lookback stats, undo on output)
 
 solver:
   base_lr: 1.0e-3
@@ -53,6 +59,7 @@ dataloader:
       neg_one_to_one: True
       seed: 2024
       period: train
+      norm_on_train: False
 
   test_dataset:
     target: Utils.Data_utils.real_datasets.CustomDataset
@@ -70,6 +77,7 @@ dataloader:
       period: test
       style: separate
       distribution: geometric
+      norm_on_train: False
 
   batch_size: 128
   sample_size: 256

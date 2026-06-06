@@ -12,3 +12,9 @@ venv/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Experiment artifacts (checkpoints + generated samples/metrics)
+Checkpoints_*/
+forecasting_exp/
+OUTPUT/
+.jupyter-runtime/
