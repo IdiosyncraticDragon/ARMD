@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """Build tutorials/armd_standalone_full.ipynb — comprehensive beginner-friendly ARMD tutorial.
 
-Covers ALL 20 paper equations, both algorithms, all project code files.
+Covers all 20 paper equations, both algorithms, and the core project code paths used by the Stock tutorial.
 Target reader: knows Python + basic ML, unfamiliar with PyTorch / DDPM.
 """
 from __future__ import annotations
+import argparse
+import filecmp
 import re
+import sys
+import tempfile
 from pathlib import Path
 import nbformat
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
@@ -66,7 +70,7 @@ def extract_utils() -> str:
             parts.append(m.group(0).rstrip())
     return "\n\n\n".join(parts) + "\n"
 
-def main() -> None:
+def build_notebook():
     # ── source code extraction ────────────────────────────────────────────────
     utils_src   = extract_utils()
     linear_raw  = read("Models/autoregressive_diffusion/linear.py")
@@ -100,7 +104,7 @@ Gao et al., *AAAI-25*，arXiv:[2412.09328](https://arxiv.org/abs/2412.09328)
 
 **本教程目标**：
 - 把论文的 **20 个公式（Eq.1–20）** 和 **2 个算法** 一一对应到代码；
-- 把仓库的 **全部核心代码文件**（`linear.py / armd.py / solver.py / lr_sch.py / real_datasets.py / build_dataloader.py / main.py`）内嵌入 notebook；
+- 把仓库核心路径（`linear.py / armd.py / solver.py / lr_sch.py / real_datasets.py / build_dataloader.py / main.py`）的关键代码、standalone replica 和等价流程内嵌到 notebook；
 - 面向**有 Python + 机器学习基础但不熟悉 PyTorch / DDPM** 的读者，逐行解释实现细节。
 
 **阅读路径**：
@@ -121,6 +125,49 @@ Gao et al., *AAAI-25*，arXiv:[2412.09328](https://arxiv.org/abs/2412.09328)
 > **快速测试模式**：找到 `QUICK_TEST = False`，改为 `True`，约 3 分钟完成全流程。
 
 **Paper reference (Stock, Table 1, z-score)**：MSE = 0.235, MAE = 0.269
+"""))
+
+    C.append(md_cell(r"""
+## 项目源码地图：从 `main.py` 到公式实现
+
+在进入公式前，先把仓库调用链摊开。ARMD 的源码不是一个单文件模型，而是由 YAML 配置动态实例化后串到训练器和数据集里的。
+下面这张表是阅读本教程和回到原仓库调试时的导航图。
+
+| 阶段 | 原始仓库入口 | 关键对象 / 函数 | standalone 中的位置 | 作用 |
+|---|---|---|---|---|
+| 配置读取 | `main.py` → `load_yaml_config(args.config_path)` | `Config/stock_paper.yaml` | H-1 | 决定模型参数、Stock 数据切分、batch、loss、RevIN、采样步数 |
+| 动态实例化 | `Utils/io_utils.py::instantiate_from_config` | `target` 字符串 → Python 类 | F/G/H | 原仓库按 YAML 的 `target` 创建 `ARMD`、`CustomDataset`、scheduler；standalone 改为直接构造 |
+| 训练数据 | `Data/build_dataloader.py::build_dataloader` | `CustomDataset(period='train')` | A-3 / G-3 | 构造 192 长度滑动窗口，并返回训练 DataLoader |
+| 测试数据 | `Data/build_dataloader.py::build_dataloader_cond` | `CustomDataset(period='test', predict_length=96)` | A-3 / G-3 / H-4 | 构造测试窗口和预测 mask；mask 后续不参与 `sample_forecast` 打分 |
+| 模型主类 | `Models/autoregressive_diffusion/armd.py::ARMD` | `forward`, `_train_loss`, `q_sample`, `fast_sample` | F-4 / C / D / E | 负责 Eq.1–3、Eq.6–10、训练 loss、RevIN 和采样链 |
+| Devolution 网络 | `Models/autoregressive_diffusion/linear.py::Linear` | `forward`, `self.w`, `self.w_dev` | F-3 / D | 负责 Eq.4–5，同时包含训练扰动和双 schedule 细节 |
+| 训练器 | `engine/solver.py::Trainer` | `train`, `sample_forecast`, `EMA` | G-2 / H-2 / H-4 | 负责梯度累积、优化器、LR scheduler、EMA 权重和评估循环 |
+| 评估入口 | `main.py` for `run in range(10)` | `trainer.sample_forecast(...)` | H-4 / I-1 / J-3 | 10 次采样平均；当前 `fast_sample` 确定性，所以多次结果理论上相同 |
+
+**从命令到指标的最短调用链**：
+
+```text
+python main.py --config_path ./Config/stock_paper.yaml
+  -> main.py: load_yaml_config
+  -> instantiate_from_config(configs["model"])
+       -> ARMD(...) -> Linear(...)
+  -> build_dataloader(configs, args)
+       -> CustomDataset(train) -> DataLoader
+  -> Trainer(...).train()
+       -> ARMD.forward -> q_sample -> Linear.forward -> _train_loss
+  -> build_dataloader_cond(configs, args)
+       -> CustomDataset(test, predict_length=96) -> DataLoader
+  -> for run in range(10): Trainer.sample_forecast(...)
+       -> ema.ema_model.generate_mts -> fast_sample -> MSE/MAE against x[:, 96:, :]
+```
+
+**standalone 改写边界**：
+
+- 保留：Stock 数据窗口、70/10/20 split、ARMD/Linear 数学逻辑、Trainer 训练口径、EMA 推理、10 次评估协议。
+- 改写：不再通过 YAML `target` 动态 import，而是在 notebook 中直接构造对象；DataLoader 直接使用已创建的 `train_ds/test_ds`；scheduler 直接构造。
+- 不执行：`main.py` 原文只作为参考展示，避免 standalone 依赖仓库包路径。
+
+这张源码地图和最后的 J-3 Algorithm 审计表互相对应：这里看“项目怎么串起来”，J-3 看“论文算法每一步落到哪一行源码”。
 """))
 
     C.append(md_cell(r"""
@@ -145,7 +192,7 @@ Gao et al., *AAAI-25*，arXiv:[2412.09328](https://arxiv.org/abs/2412.09328)
 | 论文 $t$ | 实际滑动步数 | `index = t_code + 1` | armd.py `q_sample` |
 | $T$ | 最大扩散步数（=预测长度） | `self.num_timesteps = 96` | armd.py |
 | $b, c, d$ | Eq.5 超参 | 硬编码: b=2, c=−1, d=0.5 | linear.py |
-| $\eta_{0:t}$ | 训练扰动系数（=$ \bar\alpha_t$） | `self.w_dev[t[0]]` | linear.py |
+| $\eta_t$ | 训练扰动系数（代码实际为单步 $1-\beta_t$，不是累积 $\bar\alpha_t$） | `self.w_dev[t[0]]` | linear.py |
 """))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -223,10 +270,21 @@ print(f"股票数据: {DATA_PATH}  存在={DATA_PATH.exists()}")
 
     # ── 完整 CustomDataset ────────────────────────────────────────────────────
     C.append(md_cell(r"""
-### A-3  `CustomDataset`（完整代码）
+### A-3  `CustomDataset`（standalone replica）
 
-下方是 `Utils/Data_utils/real_datasets.py::CustomDataset` 的**完整源码**，
-仅去掉了对仓库内部模块的相对 import（`masking_utils`、`model_utils`）。
+下方是 `Utils/Data_utils/real_datasets.py::CustomDataset` 的 **standalone replica**：
+保留 Stock 复现所需的窗口构造、z-score 归一化、70/10/20 时间顺序切分、预测 mask；
+删掉或简化本教程不使用的通用功能，避免依赖仓库内部工具后无法单文件运行。
+
+| 项目 | 原始仓库 | standalone 中的处理 |
+|---|---|---|
+| CSV 读取与 `name='stock'` | 保留 | 保留；仅 `name='etth'` 时丢弃日期列 |
+| `StandardScaler.fit(data)` | 保留 | 保留；与 `norm_on_train=False` 的论文 Stock 配置一致 |
+| `three_split=True` | 保留 | 保留；按窗口 70/10/20 时间顺序切分 |
+| `neg_one_to_one` | 原代码参数存在，但当前源码里 `self.auto_norm=False` | 显式固定为 False，和当前源码行为一致 |
+| `missing_ratio` 随机 mask | 调 `Utils.masking_utils.noise_mask` | 不实现；本教程只做预测，使用最后 `predict_length` 步 mask |
+| `.npy` 保存 | 原代码会保存多种 ground truth / norm truth | 本教程不依赖保存文件，保留内存中的 `samples` |
+| fMRI / ETTh 泛化路径 | 原文件还包含其它数据集逻辑 | 不纳入；standalone 专注 Stock 复现 |
 
 **PyTorch 基础提示**：
 - `torch.utils.data.Dataset`：PyTorch 数据集基类，子类必须实现 `__len__` 和 `__getitem__`。
@@ -534,6 +592,24 @@ $$p_\theta(X^{t-1}_{1:F} \mid X^t_{1:F}, c) = \mathcal{N}\!\left(X^{t-1}_{1:F};\
 """))
 
     C.append(md_cell(r"""
+### B-2b  Eq.11–17 在仓库里到底是什么地位？
+
+这一组公式很容易误读：它们不是“standalone notebook 少写了代码”，而是论文先介绍 DDPM/条件 DDPM 的标准做法，
+再解释 ARMD 为什么要改掉这些做法。对照仓库时要分清三类：
+
+| 公式 | 在仓库中的状态 | 具体线索 |
+|---|---|---|
+| Eq.11 DDPM 单步高斯加噪 | **没有作为 ARMD 前向过程执行** | `ARMD.q_sample` 不加高斯噪声，只做确定性滑动切片；`betas` 只用于构造系数 |
+| Eq.12/Eq.14 DDPM 从 $X^0$ 直接采样 $X^t$ | **被 ARMD 改写为 Eq.2/Eq.3 的代数分解** | `_train_loss` 里用 `target_noise = (x - target*alpha)/minus_alpha` 反解 $z_t$ |
+| Eq.13 $\bar\alpha_t$ 累积乘积 | **真实使用** | `alphas = 1 - betas`; `alphas_cumprod = torch.cumprod(alphas, dim=0)`；后续注册为 buffers |
+| Eq.15 DDPM 反向高斯步 | **保留了传统扩散代码路径，但论文 Stock 配置不用它** | `q_posterior` / `p_mean_variance` / `p_sample` 存在；`model.fast_sampling=True` 时走 `fast_sample` 的 Eq.8–10 |
+| Eq.16/Eq.17 条件 DDPM | **作为被 ARMD 替代的 baseline 思路，不在当前模型中实现** | 没有条件编码器 `c=g(history)`；`generate_mts(x)` 直接把 `x[:, :96, :]` 当采样链起点 |
+
+所以阅读顺序应当是：先用 Eq.11–17 理解“传统扩散为什么不适合 TSF”，再看 Eq.1–10 如何把
+“从噪声生成未来”替换为“从历史状态 devolution 到未来状态”。
+"""))
+
+    C.append(md_cell(r"""
 ### B-3  ARMA 理论 → ARMD 动机 —— Eq.18–20
 
 ARMD 的名字和设计灵感来自 **ARMA（Auto-Regressive Moving Average）**：
@@ -558,6 +634,12 @@ $$x_t = \underbrace{\phi_1 x_{t-1} + \cdots + \phi_p x_{t-p}}_{\text{AR: 自回�
 | 扰动项 $\varepsilon_{t-j}$ | 演化趋势 $z^t$（从未来到历史的偏移） |
 | AR 系数 $\phi_i$ | Linear 模块的权重 $W(t)$ |
 | MA 系数 $\theta_j$ | Linear 模块的线性层参数 |
+
+**代码地位**：Eq.18–20 不是仓库里单独执行的 ARMA 模块；源码不会显式估计
+`phi_i` / `theta_j` 或调用传统 ARMA 预测器。它们的作用是解释为什么 ARMD 把
+“历史滑动状态”与“演化趋势残差”结合起来。可执行实现仍然落在 Eq.1–10：
+`q_sample` 的滑动、`target_noise`/`pred_noise` 的趋势残差，以及 `Linear.forward`
+里的 $W(t)$ 混合。
 
 **核心改变**：不再加高斯噪声，改用**滑动（Slide）**作为前向演化：
 - 初态 = 未来序列 $X^0_{1:T}$
@@ -1168,12 +1250,22 @@ $$\boxed{X^{t-1}_{2-t:T-t+1} = \sqrt{\bar\alpha_{t-1}}\,\hat X^0(X^t,t,\theta) +
 
 ### E-3  Eq.10 —— 跳步加速采样
 
-每次跳 $k$ 步（而非每步 1 步），大幅减少推理时间：
-
 $$\boxed{X^{t-k}_{1-t+k:T-t+k} = \sqrt{\bar\alpha_{t-k}}\,\hat X^0(X^t,t,\theta) + \sqrt{1-\bar\alpha_{t-k}}\,\hat z(t,\theta)} \tag{10}$$
 
-论文中 $k$ 对应 `sampling_timesteps`，从 $\{1,2,3,4,6,8,12\}$ 中在验证集上选取。
-本教程使用 `sampling_timesteps=2`（论文补充材料 Stock 最优值）。
+Eq.10 里的 $k$ 是一次反向更新跨过的时间间隔；源码没有直接把 `sampling_timesteps` 当成这个 $k$。
+源码语义是：`sampling_timesteps` 表示**反向更新次数**，再用
+`linspace(-1, T-1, steps=sampling_timesteps+1)` 生成实际时间网格。
+
+例如 `T=96, sampling_timesteps=2` 时：
+
+```python
+times = [95, 47, -1]
+time_pairs = [(95, 47), (47, -1)]
+```
+
+也就是执行 2 次反向网络调用；第一步从 95 跳到 47，最后一步遇到 `-1` 哨兵后直接输出
+$\hat X^0$。论文/补充材料会在候选集合 $\{1,2,3,4,6,8,12\}$ 中选择这个**采样步数**。
+本教程使用 `sampling_timesteps=2`。
 
 `fast_sample` 的实现（含详细注释）：
 
@@ -1182,7 +1274,7 @@ $$\boxed{X^{t-k}_{1-t+k:T-t+k} = \sqrt{\bar\alpha_{t-k}}\,\hat X^0(X^t,t,\theta)
 def fast_sample(self, x, clip_denoised=True):
     # x: (B, 192, 6) — 完整测试窗口（含历史+未来，但只用历史半段）
     batch = x.shape[0]
-    # 生成 DDIM 跳步序列：[-1, ..., T-1]，共 sampling_timesteps+1 个点
+    # 生成 DDIM 跳步网格：sampling_timesteps 控制反向更新次数
     times = torch.linspace(-1, self.num_timesteps - 1, steps=self.sampling_timesteps + 1)
     times = list(reversed(times.int().tolist()))
     # 相邻步对：[(T-1, T-2/T-k), ..., (k, 0), (0, -1)]
@@ -1214,7 +1306,7 @@ def fast_sample(self, x, clip_denoised=True):
 | 论文步骤 | 代码 |
 |---|---|
 | 输入：历史序列 $X^T_{-T+1:0}$ | `img = x[:, :96, :]` |
-| 输入：trained $R(\cdot)$, $\Delta t$, $\bar\alpha_{0:T}$ | `model`, `sampling_timesteps`, `alphas_cumprod` |
+| 输入：trained $R(\cdot)$, 采样步数, $\bar\alpha_{0:T}$ | `model`, `sampling_timesteps`, `alphas_cumprod` |
 | for $t = T$ to $0$ by $\Delta t$ | `for time, time_next in time_pairs:` |
 | 用 $R(\cdot)$ 得到 $\hat X^0$, $\hat z$ | `x_start, pred_noise = model_predictions(img, t)` |
 | Eq.(10) 更新 | `img = x_start * alpha_next.sqrt() + c * pred_noise` |
@@ -1241,7 +1333,7 @@ def fast_sample(self, x, clip_denoised=True):
 
 `q_sample` 切片用 `index=t_code+1`，但这里 `self.alphas_cumprod[time_next]`、`model_predictions(img, time)` 都是**直接拿 `time` 当下标**，没有 +1。看似矛盾，其实一致：`q_sample` 的 `+1` 是把"论文步 $t$"换算成"滑动几步"（滑 $t$ 步要从拼接序列偏移 $t$）；而系数数组 `alphas_cumprod` 是 0-based，`alphas_cumprod[time]` 恰好就是论文第 $time{+}1$ 步的 $\bar\alpha$。两处最终都指向同一个论文步，只是一个数"滑动步数"、一个数"数组下标"。
 
-**(3) `times = linspace(-1, T-1, steps=k+1)` 里的 `-1` 是什么？**
+**(3) `times = linspace(-1, T-1, steps=sampling_timesteps+1)` 里的 `-1` 是什么？**
 
 ```python
 times = torch.linspace(-1, self.num_timesteps - 1, steps=self.sampling_timesteps + 1)
@@ -1254,6 +1346,30 @@ time_pairs = list(zip(times[:-1], times[1:]))     # → [(95,47), (47,-1)]
 **(4) 起点是历史，不是高斯噪声**
 
 `img = x[:, :pred_len, :]`（注意源码里 `img = torch.randn(...)` 那行被注释掉了）。这是 ARMD 区别于普通扩散模型的本质：采样链起点 $X^T$ ＝**已知的历史序列**，而非 $\mathcal N(0,I)$，所以只需极少步（本教程 `sampling_timesteps=2`）即可。
+
+**(5) `clip_denoised=True` 在 `fast_sample` 路径里实际没有裁剪**
+
+`fast_sample` 把 `clip_denoised` 传给 `model_predictions(..., clip_x_start=clip_denoised)`，但源码里真正裁剪的那行被注释掉了：
+
+```python
+maybe_clip = partial(torch.clamp, min=-2, max=2) if clip_x_start else identity
+x_start = self.output(x, t, training)
+# x_start = maybe_clip(x_start)   # 注释状态：没有执行
+```
+
+因此 Stock 复现走 `fast_sample` 时，`x_start` 不会被 clamp 到 `[-2, 2]`。这和 `p_mean_variance`
+传统路径里的 `x_start.clamp_(-1., 1.)` 不同；Stock paper-style 配置使用的是 `fast_sample`。
+
+**(6) `eta` 参数也被硬覆盖**
+
+源码先按 DDIM 公式计算：
+
+```python
+sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+```
+
+但下一行立刻 `sigma = 0`，再把 `noise = 0`。所以即使外部传入非零 `eta`，当前
+`fast_sample` 仍是确定性的；Eq.8 的随机项不会进入 Stock 评估。
 """))
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1263,7 +1379,19 @@ time_pairs = list(zip(times[:-1], times[1:]))     # → [(95,47), (47,-1)]
 ---
 ## Part F：代码实现（Beta Schedules / model_utils / Linear / ARMD）
 
-> 以下 Cell 内嵌仓库全部核心代码，仅去掉相对 import。直接 Run All 可用。
+> 以下 Cell 内嵌仓库核心代码。为了让 notebook 可以作为单文件运行，少量位置做了机械改写；
+> 所有改写都列在下表，避免把 standalone 版本误认为逐字源码。
+
+| Notebook 章节 | 原始文件 | standalone 中的处理 | 行为是否应与 Stock 复现一致 |
+|---|---|---|---|
+| A-3 `CustomDataset` | `Utils/Data_utils/real_datasets.py` | 手写 Stock-only replica；去掉随机缺失 mask/fMRI 泛化/.npy 依赖路径 | 是，覆盖 Stock 预测所需行为 |
+| F-2 `model_utils` | `Models/autoregressive_diffusion/model_utils.py` | 只提取 `exists/default/identity/extract` 四个 ARMD 实际使用函数 | 是 |
+| F-3 `Linear` | `Models/autoregressive_diffusion/linear.py` | 去掉未使用的仓库相对 import 和 einops import | 是 |
+| F-4 `ARMD` | `Models/autoregressive_diffusion/armd.py` | 去掉仓库相对 import；依赖前面 cell 已定义的 `Linear/default/identity/extract` | 是 |
+| G-1 LR scheduler | `engine/lr_sch.py` | 只保留 `ReduceLROnPlateauWithWarmup`，省略当前 Stock 配置不用的另一个 scheduler | 是 |
+| G-2 `Trainer` | `engine/solver.py` | 把 `instantiate_from_config` 调度器构造改为直接构造；去掉日志参数统计 import | 是 |
+| G-3 DataLoader | `Data/build_dataloader.py` | 用已创建的 `train_ds/test_ds` 直接构造 DataLoader，不再从 YAML instantiate | 是 |
+| I-2 `main.py` | `main.py` | 原文只展示不执行；上文 H/I 已把等价流程展开 | 作为参考 |
 """))
 
     C.append(md_cell("### F-1  Beta Schedules（`linear.py` 头部）\n\n已在 B-4 定义，此处已可用。"))
@@ -1284,7 +1412,7 @@ time_pairs = list(zip(times[:-1], times[1:]))     # → [(95,47), (47,-1)]
     C.append(py_cell(utils_src))
 
     C.append(md_cell(r"""
-### F-3  `Linear` 类（完整代码）—— Eq.4–5 的 Devolution 网络
+### F-3  `Linear` 类（standalone 嵌入版）—— Eq.4–5 的 Devolution 网络
 
 来自 `Models/autoregressive_diffusion/linear.py`，已去掉仓库相对 import 和 einops（不再使用）。
 
@@ -1296,8 +1424,9 @@ self.w_dev = Parameter(alphas_dev from cosine_beta_schedule)      # 不可学习
 ```
 
 为什么 `w` 和 `w_dev` 用不同 schedule？
-- `w` 作为 $W(t)$ 需要从 0 到 1 平滑变化，linear schedule 的 $\bar\alpha$ 更线性；
-- `w_dev` 作为扰动系数 $\eta_{0:t}$，cosine schedule 在 $t$ 小时变化更平缓，避免扰动过大。
+- `w` 作为 Eq.5 的 $W(t)$，初始化来自 `linear_beta_schedule(96)` 的累积乘积，并且 `requires_grad=True`；
+- `w_dev` 不是 $\eta_{0:t}$ 的累积量，而是 cosine schedule 的单步 `1-beta_t`；它在大半个时间步区间接近 1，
+  只有接近末端时快速降到 0。这个行为在 D-3 已详细拆解。
 
 **`forward` 中的形状流**：
 
@@ -1315,7 +1444,7 @@ output: (B, 96, 6)                      # X_hat^0
     C.append(py_cell(linear_src.lstrip()))
 
     C.append(md_cell(r"""
-### F-4  `ARMD` 类（完整代码）—— 主逻辑
+### F-4  `ARMD` 类（standalone 嵌入版）—— 主逻辑
 
 来自 `Models/autoregressive_diffusion/armd.py`，已去掉仓库相对 import。
 
@@ -1338,7 +1467,7 @@ output: (B, 96, 6)                      # X_hat^0
 | `sqrt_recipm1_alphas_cumprod` | $\sqrt{1/\bar\alpha_t-1}$ | `predict_noise_from_start` 分母 |
 | `loss_weight` | $\frac{\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}{100\beta_t}$ | loss 时间步加权 |
 
-**关键细节**：`t = torch.randint(0, T, (1,)).repeat(b)` —— 整个 batch 共享同一个时间步 t，而不是每个样本独立采样。这是一个实现选择，减少了梯度噪声。
+**关键细节**：`t = torch.randint(0, T, (1,)).repeat(b)` —— 整个 batch 共享同一个时间步 t，而不是每个样本独立采样。所以下游大量代码使用 `t[0]` 标量索引；如果改成每样本独立 `t`，`q_sample`、`Linear.forward` 和 `_train_loss` 都需要同步改写。
 """))
 
     C.append(py_cell(armd_src.lstrip()))
@@ -1395,6 +1524,9 @@ EMA 权重 = 0.995 * 上一步EMA权重 + 0.005 * 当前模型权重
 ### G-3  `build_dataloader`（`Data/build_dataloader.py`）
 
 把 `CustomDataset` 包装成 PyTorch `DataLoader`。
+原始 `Data/build_dataloader.py` 从 YAML config 里调用 `instantiate_from_config(...)` 创建 dataset；
+standalone 里 `train_ds/test_ds` 已经在 A-4 创建好，所以这里直接把 dataset 对象传给 DataLoader。
+DataLoader 的关键行为（batch、shuffle、drop_last、测试 mask）保持一致。
 
 **训练 vs 测试的差异**：
 
@@ -1439,7 +1571,8 @@ print(f"训练 batch 示例形状: {next(iter(train_loader)).shape}")
 x_test, mask = next(iter(test_loader))
 print(f"测试 batch 示例 x 形状: {x_test.shape}  mask 形状: {mask.shape}")
 print(f"  mask[:, :96, :] == True (历史可见)")
-print(f"  mask[:, 96:, :] == False (未来被遮掩，用于评估)")
+print(f"  mask[:, 96:, :] == False (未来区域标记为预测目标)")
+print("注意：sample_forecast 不读取 mask；评估真值直接来自 x[:, 96:, :]")
 '''
     C.append(py_cell(_build_dataloader_standalone))
 
@@ -1465,15 +1598,21 @@ print(f"  mask[:, 96:, :] == False (未来被遮掩，用于评估)")
 |---|---|---|
 | `seq_length` | 96 | 历史 = 预测步数 |
 | `timesteps` | 96 | 最大扩散步数 $T$ |
-| `sampling_timesteps` | 2 | $k$ 步跳步（从 {1,2,3,4,6,8,12} 验证集选取） |
+| `sampling_timesteps` | 2 | 反向更新次数（从 {1,2,3,4,6,8,12} 验证集选取；实际跳步网格由 `linspace` 生成） |
 | `loss_type` | `l1` | 对应 Eq.7（绝对值范数） |
 | `beta_schedule` | `cosine` | ARMD buffers 初始化 |
+| `use_revin` | `True` | 每个窗口用历史半段做 RevIN，缓解 Stock 趋势漂移 |
 | `base_lr` | 1e-3 | Adam 初始学习率 |
 | `max_epochs` | 2000 | 总 optimizer steps |
 | `gradient_accumulate_every` | 2 | 梯度累积步数 |
 | `batch_size` | 128 | 有效 batch = 128 × 2 = 256 |
 | `ema.decay` | 0.995 | EMA 衰减系数 |
 | `warmup` | 500 | LR warmup 步数 |
+
+`use_revin=True` 是当前仓库 `Config/stock_paper.yaml` 的关键设置：模型先用每个样本历史半段
+`x[:, :96, :]` 的均值/标准差把完整窗口归一化，在这个窗口内归一化空间训练和采样；
+推理输出再乘回同一组标准差并加回均值。这样评估仍在外层 `StandardScaler` 的 z-score 空间，
+但模型不必直接拟合跨年份价格水平漂移。
 """))
 
     C.append(py_cell('''\
@@ -1490,6 +1629,7 @@ QUICK_TEST = False   # True=100步/3min验证流程；False=2000步/复现论文
 MAX_EPOCHS = 100 if QUICK_TEST else 2000
 SAMPLING_TIMESTEPS = 2     # sampling_steps from {1,2,3,4,6,8,12}
 LOSS_TYPE = "l1"           # Eq.7 是 L1 loss
+USE_REVIN = True            # mirrors Config/stock_paper.yaml
 
 if QUICK_TEST:
     print(f"[快速验证模式] {MAX_EPOCHS} steps，指标不可与论文对比")
@@ -1517,6 +1657,7 @@ model = ARMD(
     loss_type=LOSS_TYPE,
     beta_schedule="cosine",
     w_grad=True,                 # W(t) 可学习
+    use_revin=USE_REVIN,          # per-window lookback normalization
 ).to(DEVICE)
 model.fast_sampling = True       # 启用 fast_sample (DDIM 跳步)
 
@@ -1524,6 +1665,7 @@ n_params = sum(p.numel() for p in model.parameters())
 print(f"模型参数: {n_params:,}  "
       f"(Linear.linear: {SEQ_LEN*SEQ_LEN + SEQ_LEN:,}; "
       f"Linear.w: {SEQ_LEN}; Linear.w_dev: {SEQ_LEN})")
+print(f"RevIN: {model.use_revin}  (stats from x[:, :{SEQ_LEN}, :], output de-normalized before scoring)")
 
 # ── solver 配置（镜像 Config/stock_paper.yaml）
 config = {
@@ -1567,21 +1709,29 @@ print("Trainer 创建完成。")
     C.append(md_cell(r"""
 ### H-2  训练循环（手动展开 `Trainer.train()`，含 Algorithm 1 对照）
 
-手动展开而非调用 `trainer.train()`，以便实时记录 loss 历史。行为完全等价。
+手动展开而非调用 `trainer.train()`，以便实时记录 loss 历史；关键训练口径与项目训练循环保持一致。
 
 **Algorithm 1 对照**（每个 optimizer step 的逻辑）：
 
 ```
 Algorithm 1 (单步):
-  1. x_start ← DataLoader (完整窗口 (B, 192, 6))     → next(trainer.dl)
-  2. t ← Uniform({1,...,T})                           → ARMD.forward 内部的 randint
-  3. X^t ← q_sample(x_start, t)                      → ARMD.q_sample
-  4. X_hat^0 ← Linear(X^t, t)                        → ARMD.output
-  5. z_hat ← predict_noise_from_start(X^t, t, X_hat0) → ARMD.model_predictions
-  6. L = L1(z_t, z_hat)                               → ARMD._train_loss
-  7. update theta ← Adam.step()                       → trainer.opt.step()
-  8. update EMA                                        → trainer.ema.update()
+  1. x_start ← DataLoader (完整窗口 (B, 192, 6))      → next(trainer.dl)
+  2. if use_revin: normalize by lookback stats       → ARMD.forward
+  3. t ← Uniform({1,...,T})                          → `randint(..., (1,)).repeat(b)`，整 batch 共享同一个 t
+  4. X^t ← q_sample(x_start, t)                      → ARMD.q_sample
+  5. X_hat^0 ← Linear(X^t, t)                        → ARMD.output
+  6. z_hat ← (X^t - sqrt(abar_t)*X_hat0)/sqrt(1-abar_t) → ARMD._train_loss 中 Eq.6 等价写法
+  7. L = L1(z_t, z_hat)                              → ARMD._train_loss
+  8. update theta ← Adam.step()                      → trainer.opt.step()
+  9. update EMA                                      → trainer.ema.update()
 ```
+
+第 2 步不是论文 Algorithm 1 的显式行，而是当前仓库为 Stock 配置加入的实现层预处理。
+它不会改变指标空间：`generate_mts` 会把预测反变换回外层 z-score 空间后再交给 `sample_forecast` 计算 MSE/MAE。
+
+第 3 步也有一个源码细节：论文写的是采样一个 $t$，仓库实现为
+`t = torch.randint(0, self.num_timesteps, (1,), device=device).repeat(b).long()`。
+因此一个训练 batch 内所有样本共享同一个时间步；后续 `_train_loss` 用 `t[0]` 取系数，正是依赖这个实现。
 """))
 
     C.append(py_cell('''\
@@ -1652,6 +1802,20 @@ print(f"初始 loss: {loss_history[0]:.6f}  最终 loss: {loss_history[-1]:.6f}"
 由于 `fast_sample` 中 `sigma=0; noise=0`（确定性），10 次结果理论上完全一致；保留 10 次只是与 `main.py` 协议对齐。
 
 **指标说明**：MSE / MAE 在 **z-score 归一化空间**计算，**不反变换**到原始价格尺度。
+
+**mask 说明**：`build_dataloader_cond` 会让测试集返回 `(x, mask)`，其中 `mask[:, 96:, :] = False`
+表示未来半段是预测目标。但 `Trainer.sample_forecast` 在预测任务中并不使用这个 mask：
+
+```python
+if len(batch) == 2:
+    x, t_m = batch
+    x, t_m = x.to(device), t_m.to(device)
+sample = self.ema.ema_model.generate_mts(x)
+reals = np.row_stack([reals, x[:, shape[0]:, :].detach().cpu().numpy()])
+```
+
+也就是说，mask 只是沿用了 infill/predict 共用数据接口；Stock 预测评估的真实值直接取
+`x[:, 96:, :]`，预测输入则在 `generate_mts/fast_sample` 内只使用 `x[:, :96, :]` 作为历史起点。
 """))
 
     C.append(py_cell('''\
@@ -1683,6 +1847,37 @@ print("论文 Table 1 参考值 (Stock, z-score): MSE=0.235  MAE=0.269")
 if QUICK_TEST:
     print("[提示] 快速验证模式，指标偏高属正常；改 QUICK_TEST=False 复现论文")
 '''))
+
+    C.append(md_cell(r"""
+### H-4b  论文 Table 1、仓库配置与本 notebook 的比较口径
+
+对 Stock 结果做比较时，先确认“比较的到底是哪一套口径”：
+
+| 项目 | 论文 Table 1 / Supplemental | 当前仓库 `Config/stock_paper.yaml` | 本 standalone 默认设置 |
+|---|---|---|---|
+| 数据 | Stock，96→96，多变量 6 特征 | `Data/datasets/stock_data.csv`，3685×6 | 同左；若 CSV 缺失会生成占位随机游走，不能比论文 |
+| 切分 | 70/10/20 时间顺序切分 | `three_split=True, train_ratio=0.7, val_ratio=0.1` | 同左 |
+| 归一化 | z-score 空间计算 MSE/MAE | `StandardScaler.fit(全部行)`；`norm_on_train=False`；`use_revin=True` 做窗口内训练/推理 | 同左 |
+| Loss | L1 | `loss_type='l1'` | 同左 |
+| 训练步数 | 2000 iterations | `max_epochs=2000` | `QUICK_TEST=False` 时同左；`True` 仅 smoke test |
+| batch | 128，梯度累积 2 | `batch_size=128`, `gradient_accumulate_every=2` | 同左 |
+| 采样步数 | 从 {1..12} 在验证集选择 | 本仓库 sweep 记录 `sampling_timesteps=2` | 同左 |
+| 评估 | 10 次采样平均 | `main.py` seeds 2023..2032；但 `fast_sample` 确定性，10 次应相同 | 同左 |
+| 论文参考值 | Stock ARMD: MSE 0.235, MAE 0.269 | 当前配置没有随文件附带已执行结果；需重新训练评估 | notebook 运行值取决于本机训练和 `QUICK_TEST` |
+
+为什么本地 paper-style run 的 MSE 可能不同于论文 Table 1？
+
+- `results/stock_paper_comparison.json` 中的 MSE≈0.0937/MAE≈0.2481 是历史本地记录，来自旧的
+  `Config/stock_paper_full_data_eval.yaml` / `Config/stock_paper_ts2.yaml` 口径；这些旧配置没有显式
+  `use_revin=True`，不能直接当作当前 `Config/stock_paper.yaml` 的结果。
+- Stock CSV 构建或窗口边界可能与作者内部实验有细微差异。
+- 论文表格可能包含多训练 seed 或不同 checkpoint 选择；本仓库 `main.py` 固定单个训练 seed。
+- `fast_sample` 本身是确定性的，所谓“10 次采样平均”在当前实现中主要是协议对齐。
+- `QUICK_TEST=True` 只验证流程，不是复现实验；只有 `QUICK_TEST=False` 才进入 2000-step paper-style 口径。
+
+因此：本 notebook 的核心目标是**把论文公式、仓库实现、复现实验口径打通**；若要严肃报告数值，
+请同时记录 config、CSV 来源、训练 seed、checkpoint/EMA、`sampling_timesteps` 和 `QUICK_TEST` 状态。
+"""))
 
     C.append(md_cell("### H-5  预测可视化"))
     C.append(py_cell('''\
@@ -1794,6 +1989,157 @@ print(mse, mae)
 4. **确定性采样 > 随机采样**：时间序列演化本身是确定性的，不需要随机噪声。
 """))
 
+    C.append(md_cell(r"""
+### I-4  线性模型实验：同一数据窗口上的 OLS / Ridge 对照
+
+为了判断 ARMD 的收益是否来自复杂的扩散式反向过程，先做一个更直接的线性基线：
+
+- 输入：同一个 Stock 滑窗的历史半段 `x[:, :96, :]`
+- 目标：同一个滑窗的未来半段 `x[:, 96:, :]`
+- 特征：把 `[96, 6]` 展平成 `576` 维
+- 模型：多输出普通最小二乘（OLS）与 Ridge 回归
+- 指标：与上文 ARMD 一样，在 z-score 归一化空间中把所有元素展平后计算 MSE / MAE
+
+这里还加入一个 Persistence 基线：重复最后一个历史观测值作为整个未来预测。它对接近随机游走的序列很强，因此是必要的 sanity check。
+
+公平性口径：如果上文 ARMD 使用 `use_revin=True`，线性模型也先按每个窗口历史半段做同样的
+RevIN，再把预测反变换回外层 z-score 空间打分；否则 OLS/Ridge 会和 ARMD 处在不同的输入空间。
+
+注意：这一节是**同一仓库、同一窗口、同一指标空间**下的 sanity check；
+它不是论文 Table 1 的外部模型排行榜项。若 `QUICK_TEST=True`，ARMD 行只代表快速流程验证，不代表正式性能。
+"""))
+
+    C.append(py_cell('''\
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+def split_context_future(samples: np.ndarray, seq_len: int):
+    """[N, 2*seq_len, F] -> flattened context, flattened future, future tensor."""
+    context = samples[:, :seq_len, :]
+    future = samples[:, seq_len:, :]
+    n = samples.shape[0]
+    return context.reshape(n, -1), future.reshape(n, -1), future
+
+
+def evaluate_flat(pred, true):
+    return (
+        float(mean_squared_error(pred.reshape(-1), true.reshape(-1))),
+        float(mean_absolute_error(pred.reshape(-1), true.reshape(-1))),
+    )
+
+
+def revin_stats_np(samples: np.ndarray, seq_len: int, eps: float = 1e-5):
+    """Per-window lookback mean/std, matching ARMD._revin_stats."""
+    ctx = samples[:, :seq_len, :]
+    mu = ctx.mean(axis=1, keepdims=True)
+    sigma = np.sqrt(ctx.var(axis=1, keepdims=True) + eps)
+    return mu, sigma
+
+
+def fit_predict_linear(regressor, train_samples, test_samples, seq_len: int, use_revin: bool):
+    """Fit context->future; with RevIN, train/predict in per-window normalized space."""
+    if use_revin:
+        mu_train, sig_train = revin_stats_np(train_samples, seq_len)
+        mu_test, sig_test = revin_stats_np(test_samples, seq_len)
+        train_work = (train_samples - mu_train) / sig_train
+        test_work = (test_samples - mu_test) / sig_test
+        X_train_i, y_train_i, _ = split_context_future(train_work, seq_len)
+        X_test_i, _, _ = split_context_future(test_work, seq_len)
+        regressor.fit(X_train_i, y_train_i)
+        pred_norm = regressor.predict(X_test_i).reshape(test_samples.shape[0], seq_len, test_samples.shape[-1])
+        return pred_norm * sig_test + mu_test
+
+    X_train_i, y_train_i, _ = split_context_future(train_samples, seq_len)
+    X_test_i, _, _ = split_context_future(test_samples, seq_len)
+    regressor.fit(X_train_i, y_train_i)
+    return regressor.predict(X_test_i).reshape(test_samples.shape[0], seq_len, test_samples.shape[-1])
+
+
+train_samples = np.asarray(train_ds.samples)
+test_samples = np.asarray(test_ds.samples)
+X_train, y_train, _ = split_context_future(train_samples, SEQ_LEN)
+X_test, y_test, y_test_seq = split_context_future(test_samples, SEQ_LEN)
+use_revin_for_linear = bool(globals().get("USE_REVIN", getattr(model, "use_revin", False)))
+
+linear_results = []
+
+# Persistence: repeat the last observed value for all future steps.
+last_value = test_samples[:, SEQ_LEN - 1:SEQ_LEN, :]
+persistence_pred = np.repeat(last_value, SEQ_LEN, axis=1)
+linear_results.append(("Persistence (last value)", *evaluate_flat(persistence_pred, y_test_seq)))
+
+ols = LinearRegression()
+ols_pred_seq = fit_predict_linear(ols, train_samples, test_samples, SEQ_LEN, use_revin_for_linear)
+ols_pred = ols_pred_seq.reshape(test_samples.shape[0], -1)
+linear_results.append(("Linear regression (OLS)", *evaluate_flat(ols_pred_seq, y_test_seq)))
+
+ridge_alpha = 1.0
+ridge = Ridge(alpha=ridge_alpha)
+ridge_pred_seq = fit_predict_linear(ridge, train_samples, test_samples, SEQ_LEN, use_revin_for_linear)
+ridge_pred = ridge_pred_seq.reshape(test_samples.shape[0], -1)
+linear_results.append((f"Linear regression (Ridge alpha={ridge_alpha:g})", *evaluate_flat(ridge_pred_seq, y_test_seq)))
+
+if "mse" in globals() and "mae" in globals():
+    linear_results.insert(0, ("ARMD (notebook run)", float(mse), float(mae)))
+
+print(f"train windows: {train_samples.shape}  test windows: {test_samples.shape}")
+print(f"linear baseline RevIN: {use_revin_for_linear}  (matches ARMD.use_revin)")
+print(f"{'model':<42}{'MSE':>12}{'MAE':>12}")
+print("-" * 66)
+for name, mse_i, mae_i in linear_results:
+    print(f"{name:<42}{mse_i:>12.4f}{mae_i:>12.4f}")
+'''))
+
+    C.append(md_cell(r"""
+### I-5  线性模型预测可视化
+
+下面随机抽取几个测试窗口，把 OLS 的预测与真实未来放在同一张图上。若上一个 ARMD 评估 cell 已运行，也会同时画出 ARMD 的预测。
+"""))
+
+    C.append(py_cell('''\
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(7)
+n_show = min(4, test_samples.shape[0])
+idx_list = rng.choice(test_samples.shape[0], size=n_show, replace=False)
+feat_show = min(2, test_samples.shape[-1])
+
+ols_seq = ols_pred_seq
+armd_available = "samples_last" in globals() and samples_last is not None
+
+fig, axes = plt.subplots(n_show, feat_show, figsize=(6 * feat_show, 2.8 * n_show), sharex=True)
+if n_show == 1:
+    axes = np.array([axes])
+if feat_show == 1:
+    axes = axes[:, None]
+
+for r, idx in enumerate(idx_list):
+    for c in range(feat_show):
+        ax = axes[r, c]
+        xh = np.arange(SEQ_LEN)
+        xf = np.arange(SEQ_LEN, 2 * SEQ_LEN)
+        ax.plot(xh, test_samples[idx, :SEQ_LEN, c], color="#555", lw=0.9,
+                label="history" if (r == 0 and c == 0) else None)
+        ax.plot(xf, y_test_seq[idx, :, c], color="#1f77b4", lw=1.0,
+                label="true future" if (r == 0 and c == 0) else None)
+        ax.plot(xf, ols_seq[idx, :, c], color="#2ca02c", lw=1.1, ls="--",
+                label="OLS" if (r == 0 and c == 0) else None)
+        if armd_available:
+            ax.plot(xf, samples_last[idx, :, c], color="#d62728", lw=1.1, ls=":",
+                    label="ARMD" if (r == 0 and c == 0) else None)
+        ax.axvline(SEQ_LEN - 0.5, color="grey", ls="--", lw=0.8)
+        ax.grid(alpha=0.3)
+        ax.set_title(f"test window #{int(idx)} feat{c}", fontsize=9)
+        if c == 0:
+            ax.set_ylabel("z-score", fontsize=8)
+
+axes[0, 0].legend(loc="upper left", fontsize=8)
+fig.suptitle("Linear baseline vs true future", y=1.01)
+plt.tight_layout()
+plt.show()
+'''))
+
     # ══════════════════════════════════════════════════════════════════════════
     # Part J: 总结
     # ══════════════════════════════════════════════════════════════════════════
@@ -1805,28 +2151,65 @@ print(mse, mae)
 
 | 公式编号 | 内容 | 代码位置 |
 |---|---|---|
-| **Eq.1** | 单步滑动 $X^t = \mathrm{Slide}(X^{t-1}, 1)$ | `ARMD.q_sample`，`index=t_code+1` |
-| **Eq.2** | t 步中间态 $= \sqrt{\bar\alpha_t}X^0 + \sqrt{1-\bar\alpha_t}z_t$ | `_train_loss` 代数关系 |
-| **Eq.3** | 真实演化趋势 $z_t$ | `target_noise = (x - target*alpha)/minus_alpha` |
-| **Eq.4** | 距离预测 $D = \mathrm{Linear}(X^t)$ | `Linear.forward` → `x_tmp = linear(input_.T).T` |
-| **Eq.5** | 预测 $\hat X^0$ | `(alpha*input_ + (1-2*alpha)*x_tmp) / (1-alpha)^0.5` |
-| **Eq.6** | 预测趋势 $\hat z$ | `predict_noise_from_start(x_t, t, x0)` |
-| **Eq.7** | L1 训练目标 $\mathcal{L}=\|z_t-\hat z\|$ | `_train_loss` 中 `loss_fn(pred_noise, target_noise)` |
-| **Eq.8** | DDIM 完整反向步（含 $\sigma_t\varepsilon_t$） | `fast_sample`（$\sigma=0$，项被去掉） |
-| **Eq.9** | 确定性简化反向步（$\sigma_t=0$） | `fast_sample` 主逻辑 |
-| **Eq.10** | 跳步加速采样 | `fast_sample` 的 `time_pairs` 循环 |
-| **Eq.11** | DDPM 单步前向 $q(X^t\|X^{t-1})$ | 背景知识，`linear_beta_schedule` |
-| **Eq.12** | DDPM 边缘 $q(X^t\|X^0)$ | 背景知识 |
-| **Eq.13** | $\bar\alpha_t = \prod_{k=1}^t \alpha_k$ | `torch.cumprod(alphas, dim=0)` |
-| **Eq.14** | 直接采样 $X^t = \sqrt{\bar\alpha}X^0 + \sqrt{1-\bar\alpha}\varepsilon$ | Eq.2 的类比（ARMD 改写） |
-| **Eq.15** | DDPM 反向 $p_\theta(X^{t-1}\|X^t)$ | 背景知识 |
-| **Eq.16** | 条件 DDPM for TSF | 背景知识（ARMD 所改进的对象） |
-| **Eq.17** | 条件单步去噪 | 背景知识 |
-| **Eq.18** | AR 成分 | ARMD 名称来源（动机） |
-| **Eq.19** | MA 成分 | ARMD 名称来源（动机） |
-| **Eq.20** | 完整 ARMA 模型 | ARMD 设计灵感 |
+| **Eq.1** | 单步滑动 $X^t = \mathrm{Slide}(X^{t-1}, 1)$ | `Models/autoregressive_diffusion/armd.py::ARMD.q_sample`，`index=t_code+1` |
+| **Eq.2** | t 步中间态 $= \sqrt{\bar\alpha_t}X^0 + \sqrt{1-\bar\alpha_t}z_t$ | `ARMD._train_loss` 使用 `q_sample` 得到 `x`，并用 `target_noise = (x - target*alpha)/minus_alpha` 反解该式 |
+| **Eq.3** | 真实演化趋势 $z_t$ | `ARMD._train_loss`: `target_noise = (x - target*alpha)/minus_alpha` |
+| **Eq.4** | 距离预测 $D = \mathrm{Linear}(X^t)$ | `Models/autoregressive_diffusion/linear.py::Linear.forward` → `x_tmp = linear(input_.T).T` |
+| **Eq.5** | 预测 $\hat X^0$ | `Linear.forward`: `output = (alpha*input_ + (1-2*alpha)*x_tmp) / (1-alpha)^0.5` |
+| **Eq.6** | 预测趋势 $\hat z$ | `ARMD.predict_noise_from_start(x_t, t, x0)` |
+| **Eq.7** | L1 训练目标 $\mathcal{L}=\|z_t-\hat z\|$ | `ARMD._train_loss`: `loss_fn(pred_noise, target_noise)`，随后乘 `loss_weight` |
+| **Eq.8** | DDIM 完整反向步（含 $\sigma_t\varepsilon_t$） | `ARMD.fast_sample`: 公式结构保留，但 `sigma = 0`、`noise = 0` 去掉随机项 |
+| **Eq.9** | 确定性简化反向步（$\sigma_t=0$） | `ARMD.fast_sample`: `img = x_start * alpha_next.sqrt() + c * pred_noise` |
+| **Eq.10** | 跳步加速采样 | `ARMD.fast_sample` 的 `time_pairs` 循环；`sampling_timesteps=2` 时 pairs 为 `(95,47),(47,-1)` |
+| **Eq.11** | DDPM 单步前向 $q(X^t\|X^{t-1})$ | B-2b：ARMD 不执行高斯加噪；`ARMD.q_sample` 改为滑动切片 |
+| **Eq.12** | DDPM 边缘 $q(X^t\|X^0)$ | B-2b/C-3：被 Eq.2/Eq.3 的确定性中间态分解替代 |
+| **Eq.13** | $\bar\alpha_t = \prod_{k=1}^t \alpha_k$ | `ARMD.__init__`: `torch.cumprod(alphas, dim=0)` |
+| **Eq.14** | 直接采样 $X^t = \sqrt{\bar\alpha}X^0 + \sqrt{1-\bar\alpha}\varepsilon$ | B-2b/C-3：只作类比；ARMD 用反解出的 `target_noise`，不是随机 $\varepsilon$ |
+| **Eq.15** | DDPM 反向 $p_\theta(X^{t-1}\|X^t)$ | `ARMD.p_sample` 传统路径保留；Stock 复现走 `ARMD.fast_sample` Eq.8–10 |
+| **Eq.16** | 条件 DDPM for TSF | B-2/B-2b：被替代方案；仓库没有条件编码器 `c=g(history)` |
+| **Eq.17** | 条件单步去噪 | B-2/B-2b：被替代方案；历史直接作为采样起点 `x[:, :96, :]` |
+| **Eq.18** | AR 成分 | B-3 动机类比；仓库没有单独 ARMA 模块 |
+| **Eq.19** | MA 成分 | B-3 动机类比；趋势残差由 `target_noise`/`pred_noise` 承担 |
+| **Eq.20** | 完整 ARMA 模型 | B-3 动机类比；仓库没有单独 ARMA 模块，可执行实现落在 Eq.1–10 |
 
-### J-2  复现 Checklist
+### J-2  公式外但必须核对的代码实现
+
+论文公式给出 ARMD 主干，但当前仓库还有几处会显著影响 Stock 复现结果的实现选择：
+
+| 实现点 | 原始代码位置 | 本教程位置 | 为什么重要 |
+|---|---|---|---|
+| RevIN 窗口内归一化 | `ARMD.forward` / `ARMD.generate_mts` 的 `use_revin` 分支 | H-1/H-4/I-4 | Stock 趋势漂移明显；训练和推理都在每窗口历史统计量归一化空间进行，输出再反变换 |
+| `q_sample` 的下标偏移 | `ARMD.q_sample`: `index = int(t[0]) + 1` | C-2/C-5/J checklist | 代码时间步 `t_code=0` 已经滑动 1 步，不是论文的 0 步初态 |
+| 训练扰动的原地写入 | `Linear.forward`: `input_ += ...` | D-3/D-3b | `q_sample` 返回视图，训练扰动会影响同一 storage 上的 target 切片 |
+| 双 schedule | `Linear.w` 用 linear；`ARMD` buffers 用 cosine | B-4/D-3/F-3 | `W(t)` 与 Eq.2/3/6 的 $\bar\alpha_t$ 不是同一组数 |
+| 确定性采样 | `fast_sample`: `sigma = 0`, `noise = 0` | E-4/H-4 | Algorithm 2 的随机项在仓库实现中被关闭 |
+| 采样裁剪/eta 无效 | `model_predictions`: `#x_start = maybe_clip(x_start)`；`fast_sample`: `sigma = 0` | E-4 | `clip_denoised=True` 不会裁剪 `x_start`；非零 `eta` 也会被覆盖为确定性采样 |
+| EMA 推理 | `Trainer.sample_forecast`: `self.ema.ema_model.generate_mts(x)` | H-4/J checklist | 指标来自 EMA 模型，不是即时训练权重 |
+| 测试 mask 不参与预测评分 | `Trainer.sample_forecast`: 读出 `t_m` 但后续不用；`reals = x[:, shape[0]:, :]` | G-3/H-4 | mask 标记未来目标区域，但 MSE/MAE 直接比较预测和 `x[:,96:,:]` |
+
+### J-3  Algorithm 1/2 源码审计表
+
+如果只看论文 Algorithm 1/2，很容易漏掉仓库实现中的 batch 时间步、RevIN、EMA、mask、确定性采样等细节。
+下面这张表把“论文步骤 → 原始源码 → standalone 章节 → 实现备注”集中放在一起，作为复现前的最后审计入口。
+
+| 论文算法步骤 | 原始源码证据 | standalone 位置 | 实现备注 |
+|---|---|---|---|
+| Algorithm 1 输入 $X^0_{1:T}$ | `Trainer.train`: `data = next(self.dl).to(device)`；`ARMD._train_loss`: `target = x_start[:,pred_len:,:]` | H-2 / F-4 | DataLoader 给的是完整 192 窗口；真实未来目标来自后 96 步 |
+| Algorithm 1 采样时间步 $t$ | `ARMD.forward`: `torch.randint(0, self.num_timesteps, (1,)).repeat(b).long()` | D-5 / H-2 | 整个 batch 共享同一个 `t[0]`，不是每个样本独立时间步 |
+| Algorithm 1 生成 $X^t$ | `ARMD.q_sample`: `index = int(t[0])+1`; `x_start[:,pred_len-index:-index,:]` | C-2 / C-5 | `t_code=0` 已滑动 1 步；`q_sample` 不使用传入的 `noise` |
+| Algorithm 1 计算 $z_t$ | `_train_loss`: `target_noise = (x - target*alpha)/minus_alpha` | C-4 / D-5 | 不是随机高斯噪声，而是由确定性滑动状态反解出的演化趋势 |
+| Algorithm 1 调用 $R(\cdot)$ | `ARMD.output` → `Linear.forward` → `self.linear(input_.permute(...))` | D-1 / F-3 | `Linear` 是 Devolution backbone；输入会先加训练扰动 |
+| Algorithm 1 计算 $\hat z$ 和 loss | `_train_loss`: `pred_noise = ...`; `loss_fn(...); loss_weight` | D-4 / D-5b | Eq.7 之外还乘了代码级 `loss_weight` 时间步权重 |
+| Algorithm 1 更新参数 | `Trainer.train`: `loss.backward`; `clip_grad_norm_`; `opt.step`; `sch.step`; `ema.update` | G-2 / H-2 | 训练循环还包含梯度累积、梯度裁剪、LR scheduler 和 EMA 更新 |
+| Algorithm 2 输入历史序列 | `fast_sample`: `img = x[:,:pred_len,:]` | E-3 / H-4 | 采样起点是历史半段，不是随机噪声，也不是显式条件编码 |
+| Algorithm 2 采样时间网格 | `torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)` | E-3 / E-4 | `sampling_timesteps=2` 表示 2 次网络更新；实际 pairs 为 `(95,47),(47,-1)` |
+| Algorithm 2 调用训练后的 $R(\cdot)$ | `Trainer.sample_forecast`: `self.ema.ema_model.generate_mts(x)` | G-2 / H-4 | 评估使用 EMA 模型，不是即时训练权重 |
+| Algorithm 2 Eq.10 更新 | `img = x_start * alpha_next.sqrt() + c * pred_noise` | E-3 / E-4 | `sigma=0; noise=0` 硬编码，采样过程确定性 |
+| Algorithm 2 输出 $X^0_{1:T}$ | `if time_next < 0: img = x_start`; `return img` | E-4 / H-4 | `-1` 是结束哨兵；最后一步直接输出 $\hat X^0$ |
+| Algorithm 2 评估真实值 | `sample_forecast`: `reals = x[:,shape[0]:,:]` | G-3 / H-4 | `mask` 被读出但不参与预测评分；MSE/MAE 对后 96 步逐元素计算 |
+| Stock paper-style RevIN | `ARMD.forward` / `generate_mts`: `_revin_stats(x)` | H-1 / I-4 | 这是当前 `Config/stock_paper.yaml` 的关键协议字段，不在原论文算法伪代码中显式出现 |
+
+### J-4  复现 Checklist
 
 在与论文 Table 1 对比前，逐项确认：
 
@@ -1834,9 +2217,11 @@ print(mse, mae)
 - [ ] **切分**：70/10/20 时间顺序（`three_split=True, train_ratio=0.7, val_ratio=0.1`）
 - [ ] **归一化**：`StandardScaler.fit(全部行)`（不分段 fit）
 - [ ] **Loss**：`loss_type='l1'`（Eq.7 是 L1，不是 L2）
-- [ ] **采样步数**：`sampling_timesteps=2`（从 {1,2,3,4,6,8,12} 选取）
+- [ ] **采样步数**：`sampling_timesteps=2` 表示 2 次反向更新；实际时间网格由 `linspace(-1, T-1, steps=3)` 生成
+- [ ] **RevIN**：`use_revin=True`，训练/推理都用 `x[:, :96, :]` 的窗口内统计量
 - [ ] **批大小**：`batch_size=128`，`gradient_accumulate_every=2`
 - [ ] **训练步数**：`max_epochs=2000`（`QUICK_TEST=False`）
+- [ ] **训练时间步**：`torch.randint(..., (1,)).repeat(b)`，整 batch 共享同一个 `t[0]`
 - [ ] **q_sample 偏移**：`index = t_code + 1`（不是 `t_code`）
 - [ ] **确定性采样**：`fast_sample` 中 `sigma=0; noise=0`
 - [ ] **推理起点**：`x[:, :96, :]`（历史半段，不是随机噪声）
@@ -1846,11 +2231,41 @@ print(mse, mae)
 - [ ] **`w_grad=True`**：W(t) 可学习（不要固定为 alpha_bar_t）
 """))
 
+    return nb
+
+
+def write_notebook(path: Path) -> None:
+    nb = build_notebook()
     # 不写入显式 cell id（与 macOS / 新版 nbformat 兼容；由 nbformat 按需生成）
-    nbformat.write(nb, OUT)
-    print(f"Wrote {OUT}")
+    nbformat.write(nb, path)
+    print(f"Wrote {path}")
     print(f"Total cells: {len(nb.cells)}")
 
 
+def check_notebook_current() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / OUT.name
+        nbformat.write(build_notebook(), tmp_path)
+        if filecmp.cmp(OUT, tmp_path, shallow=False):
+            print(f"Generated notebook is up to date: {OUT}")
+            return 0
+        print(f"Generated notebook is stale: {OUT}")
+        print("Run: python tutorials/generate_armd_standalone_notebook.py")
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Build tutorials/armd_standalone_full.ipynb")
+    parser.add_argument("--check", action="store_true", help="verify the checked-in notebook matches this generator")
+    parser.add_argument("--output", type=Path, default=OUT, help="notebook output path")
+    args = parser.parse_args(argv)
+
+    if args.check:
+        return check_notebook_current()
+
+    write_notebook(args.output)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

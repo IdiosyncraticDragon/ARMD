@@ -12,28 +12,34 @@ This is the official repo for "Auto-Regressive Moving Diffusion Models for Time 
    pip install -r requirements.txt
    ```
 
-**Tutorial notebook (minimal env with [uv](https://docs.astral.sh/uv/)):** see [`tutorials/armd_stock_tutorial.ipynb`](tutorials/armd_stock_tutorial.ipynb).
+**Tutorial notebooks (minimal env with [uv](https://docs.astral.sh/uv/)):**
+
+- [`tutorials/armd_standalone_full.ipynb`](tutorials/armd_standalone_full.ipynb): self-contained paper-to-code tutorial. Prefer this for formula-by-formula study and the paper-style Stock protocol (`Config/stock_paper.yaml`: 70/10/20 split, L1, RevIN, `sampling_timesteps=2`).
+- [`tutorials/armd_stock_tutorial.ipynb`](tutorials/armd_stock_tutorial.ipynb): lightweight project-import tutorial. It defaults to `Config/stock.yaml` (80/20 split, L2, `sampling_timesteps=1`) and is meant for learning repository entry points rather than Table 1 comparison.
+- [`tutorials/armd_standalone_full_preview.html`](tutorials/armd_standalone_full_preview.html): rendered preview synchronized from the current standalone notebook.
+- [`tutorials/standalone_audit.md`](tutorials/standalone_audit.md): requirement-to-evidence audit for the standalone tutorial, paper anchors, source anchors, formula index, protocol notes, and validation gates.
+- More details and maintenance commands are in [`tutorials/usage.md`](tutorials/usage.md). After tutorial edits, run `python tutorials/generate_armd_standalone_notebook.py --check` and `python scripts/validate_standalone_notebook.py`.
 
 First install deps from [`pyproject.toml`](pyproject.toml): `uv sync`
 
 Then start Jupyter with **one** of the following (there is **no** `notebook` executable: `uv run notebook` fails with “program not found”):
 
 ```
-uv run jupyter notebook tutorials/armd_stock_tutorial.ipynb
+uv run jupyter notebook tutorials/armd_standalone_full.ipynb
 ```
 
 ```
-uv run python -m notebook tutorials/armd_stock_tutorial.ipynb
+uv run python -m notebook tutorials/armd_standalone_full.ipynb
 ```
 
 ```
-uv run jupyter-notebook tutorials/armd_stock_tutorial.ipynb
+uv run jupyter-notebook tutorials/armd_standalone_full.ipynb
 ```
 
 Headless execution (from repository root; set `ARMD_REPO` if cwd is wrong). Use **`--no-sync`** so `uv run` does not reinstall `torch` on every invocation:
 
 ```
-uv run --no-sync python -m jupyter nbconvert --execute tutorials/armd_stock_tutorial.ipynb --inplace
+uv run --no-sync python -m jupyter nbconvert --execute tutorials/armd_standalone_full.ipynb --to notebook --output tutorials/armd_standalone_out.ipynb
 ```
 
 For full parity with the original experiments (GluonTS, MuJoCo, etc.), install `requirements.txt` in a separate environment.
